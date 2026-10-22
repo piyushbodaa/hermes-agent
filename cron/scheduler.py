@@ -2599,7 +2599,7 @@ def run_job(
     logger.info("Prompt: %s", prompt[:100])
 
     agent = None
-    model = ""
+    model, result = "", None
     _session_db = None
     _audit: Optional[_FireAudit] = None
     _worker_state: dict = {}
@@ -2652,13 +2652,12 @@ def run_job(
     except Exception as e:
         error_msg = f"{type(e).__name__}: {e!s}"
         logger.exception("Job '%s' failed: %s", job_name, error_msg)
-        # Cowork-style unreachable-model re-run (cron/unreachable_retry.py): flag failures where
-        # the model was never reached (transient network/DNS, zero API calls) so the bookkeeping
-        # tail can schedule a bounded automatic re-run instead of waiting a full period.
+        # Bounded automatic re-runs (cron/unreachable_retry.py): flag failures proven
+        # side-effect-free (model never reached, or session storage locked before any
+        # tool ran) so bookkeeping can re-run instead of waiting a full period.
         try:
-            from cron.unreachable_retry import is_model_unreachable_failure
-            if is_model_unreachable_failure(e, agent):
-                job["_model_unreachable"] = True
+            from cron.unreachable_retry import flag_transient_retry_failure
+            flag_transient_retry_failure(job, e, agent, result)
             # Provider usage window closed for a known duration (cron/quota_hold.py): flag it so the
             # bookkeeping tail parks the job past the window instead of re-firing into it (#89376).
             from cron.quota_hold import hold_seconds_from_failure
@@ -3102,11 +3101,11 @@ def _save_compose_deliver(
         output_file=output_file, agent_declared=d.agent_declared)
     # Whitespace-only == empty: skip delivery; the guard below marks it a soft failure.
     d.should_deliver = bool(deliver_content.strip()) and not _silent_alert
-    if d.should_deliver and not d.success and job.get("_model_unreachable"):
-        # The model was never reached and a bounded automatic re-run will be scheduled
+    if d.should_deliver and not d.success and (job.get("_model_unreachable") or job.get("_session_storage_busy")):
+        # No tool ran and a bounded automatic re-run will be scheduled
         # (cron/unreachable_retry.py): hold the failure notice — the re-run either
         # delivers the real result or, once the ladder is exhausted, the next failure
-        # alerts normally. Mirrors Cowork's silent 5/15/30-minute re-runs.
+        # alerts normally. Mirrors Cowork's silent re-runs.
         from cron.unreachable_retry import will_retry
         if will_retry(job):
             d.should_deliver = False

@@ -469,12 +469,19 @@ back to the normal schedule. Because zero API calls were made, the re-run is
 spend-neutral and cannot duplicate any side effect. Re-runs also do not count
 toward a job's `repeat` limit: the occurrence they repeat already counted once.
 
+The same protection covers a narrower storage outage: if a turn fails closed
+because the session store stayed locked **before any tool call or tool result
+in that turn**, it re-runs after **1 and 5 minutes**. A locked-store failure
+after a tool may have run is never re-run automatically, because repeating it
+could duplicate that tool's effects.
+
 While a re-run is pending, the interim failure notice is suppressed — you get
 the real result when a re-run succeeds, or a normal failure alert once the
-ladder is exhausted. Any run that reaches the model (success or failure)
-resets the ladder. One-shot jobs are excluded: their dispatch accounting is
-at-most-times and a consumed dispatch is never resurrected. Retries never
-fire past the schedule's own next occurrence when that comes sooner.
+ladder is exhausted. Any run that gets past the transient gate (success or
+failure) resets the ladder. One-shot jobs are excluded: their dispatch
+accounting is at-most-times and a consumed dispatch is never resurrected.
+Retries never fire past the schedule's own next occurrence when that comes
+sooner.
 
 ```yaml
 cron:

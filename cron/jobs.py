@@ -2431,7 +2431,7 @@ def mark_job_run(
     *,
     expected_fire_owner: Optional[str] = None,
     execution_id: Optional[str] = None,
-    model_unreachable: bool = False,
+    model_unreachable: bool = False, storage_busy: bool = False,
     ladder_rung: bool = False,
     quota_hold_seconds: Optional[float] = None,
     recover_consumed_fire: bool = False,
@@ -2444,12 +2444,12 @@ def mark_job_run(
     explicit ``status`` (e.g. "blocked_config") overrides the derived value. False when the fence
     can't be taken, the job is missing, or ``expected_fire_owner`` no longer holds the fire claim.
 
-    ``model_unreachable``: this failed run never reached the model (transient network/DNS error,
-    zero API calls). Recurring jobs then get a bounded automatic re-run — ``next_run_at`` is pulled
-    earlier per ``cron.unreachable_retry.RETRY_DELAYS_SECONDS`` — instead of waiting a full period
-    (Cowork-style; see cron/unreachable_retry.py). ``ladder_rung``: this run IS one of those
-    re-runs (``is_retry_run``); its occurrence already counted, so ``repeat.completed`` is not
-    bumped again.
+    ``model_unreachable`` / ``storage_busy``: this failed run is proven pre-tool (the model was
+    never reached, or session storage stayed locked before any tool ran). Recurring jobs then
+    get a bounded automatic re-run — ``next_run_at`` is pulled earlier per the cause's ladder in
+    cron/unreachable_retry.py — instead of waiting a full period. ``ladder_rung``: this run IS
+    one of those re-runs (``is_retry_run``); its occurrence already counted, so
+    ``repeat.completed`` is not bumped again.
 
     ``quota_hold_seconds``: the provider said it stays closed for this long (a quota 429 with
     ``retry after <N>s``). Recurring jobs are parked through the window instead of re-firing into
@@ -2476,10 +2476,10 @@ def mark_job_run(
         from cron import quota_hold
         from cron.unreachable_retry import clear_state, plan_retry
 
-        if not success and model_unreachable and not is_terminal_job(job):
-            plan_retry(job)
+        if not success and (model_unreachable or storage_busy) and not is_terminal_job(job):
+            plan_retry(job, cause="storage_busy" if storage_busy else "model_unreachable")
         else:
-            # Any run that reached the model (either outcome) resets the re-run ladder.
+            # Any run past the transient gate (either outcome) resets the re-run ladder.
             clear_state(job)
         if not success and quota_hold_seconds and not is_terminal_job(job):
             quota_hold.plan_hold(job, quota_hold_seconds, recover_consumed_fire=recover_consumed_fire)

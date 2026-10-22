@@ -7,6 +7,7 @@ ladder never fires past its last rung.
 """
 
 from datetime import datetime, timedelta, timezone, UTC
+from types import SimpleNamespace
 
 import pytest
 
@@ -195,3 +196,92 @@ def test_ladder_reruns_do_not_spend_extra_repeat_budget(tmp_cron_home, monkeypat
     assert held == [True, True, True, False]
     # But a rung whose limit was edited down to the count does retire the job: send its notice.
     assert not ur.will_retry(dict(runs[1], repeat={"times": 1, "completed": 1}))
+
+
+def _storage_result(**overrides):
+    result = {
+        "failed": True,
+        "failure_reason": "session_persistence_failed:locked",
+        "current_turn_user_idx": 1,
+        "messages": [
+            {"role": "tool", "content": "an earlier occurrence's tool result"},
+            {"role": "user", "content": "run the brief"},
+            {"role": "assistant", "content": "working on it"},
+        ],
+    }
+    result.update(overrides)
+    return result
+
+
+def test_storage_busy_classifier_only_retries_pre_tool_locked_turn():
+    """#138160: a cron turn aborted because session storage stayed locked may
+    re-run only while it is proven pre-tool. Once a tool may have executed,
+    an automatic re-run could duplicate its side effects."""
+    assert ur.is_session_storage_busy_failure(_storage_result())
+    assert not ur.is_session_storage_busy_failure(
+        _storage_result(failure_reason="session_persistence_failed:disk"))
+    assert not ur.is_session_storage_busy_failure(_storage_result(failed=False))
+    assert not ur.is_session_storage_busy_failure(_storage_result(messages=[
+        {"role": "user", "content": "run the brief"},
+        {"role": "tool", "content": "already ran"},
+    ], current_turn_user_idx=0))
+    assert not ur.is_session_storage_busy_failure(_storage_result(messages=[
+        {"role": "user", "content": "run the brief"},
+        {"role": "assistant", "tool_calls": [{"id": "call-1"}]},
+    ], current_turn_user_idx=0))
+    assert not ur.is_session_storage_busy_failure(
+        _storage_result(),
+        SimpleNamespace(_incremental_persistence_failed=True))
+
+    job = {}
+    ur.flag_transient_retry_failure(
+        job, RuntimeError("session storage was busy"), result=_storage_result())
+    assert job == {"_session_storage_busy": True}
+
+
+def test_storage_busy_failure_uses_short_bounded_ladder(tmp_cron_home):
+    """Storage locks already outwaited the store's own patience, so the
+    deferred ladder is shorter than the model-unreachable one — and still
+    gives up to the natural schedule after its last rung."""
+    job = create_job("daily research brief", "every 24h")
+    job_id = job["id"]
+    now = datetime.now(UTC)
+
+    for i, delay in enumerate(ur.STORAGE_BUSY_RETRY_DELAYS_SECONDS):
+        assert mark_job_run(
+            job_id, False, "session storage was busy", storage_busy=True)
+        j = get_job(job_id)
+        nxt = datetime.fromisoformat(j["next_run_at"])
+        assert timedelta(0) < nxt - now <= timedelta(seconds=delay + 120)
+        assert j[ur.STATE_KEY]["attempt"] == i + 1
+        assert j[ur.STATE_KEY]["cause"] == "storage_busy"
+
+    assert mark_job_run(
+        job_id, False, "session storage was busy", storage_busy=True)
+    j = get_job(job_id)
+    assert j.get(ur.STATE_KEY) is None
+    assert datetime.fromisoformat(j["next_run_at"]) - now > timedelta(hours=1)
+
+
+def test_storage_busy_flag_reaches_mark_job_run(tmp_cron_home, monkeypatch):
+    """The scheduler bookkeeping tail must translate the in-memory flag into
+    mark_job_run's fenced retry planning, exactly like _model_unreachable."""
+    captured = {}
+    real_mark_job_run = sched.mark_job_run
+
+    def capture_mark_job_run(job_id, success, error, **kwargs):
+        captured.update(kwargs)
+        return real_mark_job_run(job_id, success, error, **kwargs)
+
+    monkeypatch.setattr(sched, "mark_job_run", capture_mark_job_run)
+    monkeypatch.setattr(sched, "finish_execution", lambda *_a, **_kw: None)
+    job = create_job("daily research brief", "every 24h")
+    run = dict(get_job(job["id"]), _session_storage_busy=True)
+
+    assert finish_completed_run(
+        sched._RunDelivery(
+            job=run, success=False, error="session storage was busy"),
+        None, "exec-storage-busy")
+
+    assert captured["storage_busy"] is True
+    assert get_job(job["id"])[ur.STATE_KEY]["cause"] == "storage_busy"
