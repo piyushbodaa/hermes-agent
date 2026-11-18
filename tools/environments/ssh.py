@@ -1,5 +1,6 @@
 """SSH remote execution environment with ControlMaster connection persistence."""
 
+from concurrent.futures import ThreadPoolExecutor
 import contextlib
 import hashlib
 import logging
@@ -14,7 +15,7 @@ from typing import Iterable
 from tools.environments.base import BaseEnvironment, EnvironmentConnectionError
 from tools.environments.base_output import _popen_bash
 from tools.environments.file_sync import (
-    FileSyncManager, iter_sync_files, quoted_mkdir_command, quoted_rm_command, unique_parent_dirs)
+    FileSyncManager, iter_sync_files, quoted_mkdir_command, quoted_rm_command, sync_back_writer, unique_parent_dirs)
 from tools.environments.remote_common import (
     bash_argv, client_env_with, load_hermes_env_vars, prepend_unset, resolve_passthrough_env, run_capture)
 
@@ -254,15 +255,40 @@ class SSHEnvironment(BaseEnvironment):
         # multi-GB temp tar behind on each retry. Exclude them up front.
         ssh_cmd = self._build_ssh_command() + [
             f"tar cf - --exclude='*.sock' -C / {shlex.quote(rel_base)}"]
-        with open(dest, "wb") as f:
-            result = subprocess.run(ssh_cmd, stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.PIPE, timeout=120, check=False)
-        if result.returncode != 0:
-            stderr = result.stderr.decode(errors="replace").strip()
+        with subprocess.Popen(ssh_cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as proc:
+            def save_archive():
+                try:
+                    with sync_back_writer(dest) as write:
+                        for chunk in iter(lambda: proc.stdout.read(64 * 1024), b""):
+                            write(chunk)
+                except BaseException:
+                    proc.kill()
+                    raise
+
+            def read_diagnostics():
+                # Drain stderr concurrently so neither pipe can deadlock the SSH process.
+                data = proc.stderr.read(64 * 1024 + 1)
+                if len(data) > 64 * 1024:
+                    proc.kill()
+                    raise RuntimeError("SSH bulk download produced excessive diagnostics")
+                return data.decode(errors="replace").strip()
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                output = pool.submit(save_archive)
+                errors = pool.submit(read_diagnostics)
+                try:
+                    returncode = proc.wait(timeout=120)
+                finally:
+                    if proc.poll() is None:
+                        proc.kill()
+                output.result()
+                stderr = errors.result()
+        if returncode != 0:
             # A socket not named *.sock is the only rc=2 we knowingly accept, and only when
             # nothing else was reported — anchored to the diagnostic suffix so a filename merely
             # containing "socket ignored" cannot sneak through. Every other status still fails.
             diagnostic_lines = [line for line in stderr.splitlines() if line.strip()]
-            tolerated = result.returncode == 2 and bool(diagnostic_lines) and all(
+            tolerated = returncode == 2 and bool(diagnostic_lines) and all(
                 line.endswith(": socket ignored") for line in diagnostic_lines)
             if not tolerated:
                 raise _sync_error(f"SSH bulk download failed: {stderr}",

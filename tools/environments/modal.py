@@ -15,7 +15,7 @@ from hermes_constants import get_hermes_home
 from tools.environments.base import BaseEnvironment, _load_json_store, _update_json_store
 from tools.environments.base_output import _ThreadedProcessHandle
 from tools.environments.file_sync import (
-    FileSyncManager, iter_sync_files, quoted_mkdir_command, quoted_rm_command, unique_parent_dirs)
+    FileSyncManager, iter_sync_files, quoted_mkdir_command, quoted_rm_command, sync_back_writer, unique_parent_dirs)
 from tools.environments.remote_common import bash_argv, ensure_lazy_dep
 
 logger = logging.getLogger(__name__)
@@ -187,20 +187,15 @@ class ModalEnvironment(BaseEnvironment):
         self._sync_manager.sync(force=True)
         self.init_session()
 
-    def _exec(self, cmd: str, *, timeout: int, stdin: str | None = None, fail_label: str | None = None,
-              capture: bool = False):
-        """Run ``bash -c cmd`` in the sandbox. ``stdin`` is streamed in chunks; ``capture`` returns
-        stdout; ``fail_label`` turns a non-zero exit into RuntimeError (with stderr unless capturing)."""
+    def _exec(self, cmd: str, *, timeout: int, stdin: str | None = None, fail_label: str | None = None):
+        """Run a command, optionally streaming stdin and reporting a non-zero exit."""
         async def _run():
             proc = await self._sandbox.exec.aio("bash", "-c", cmd)
             if stdin is not None:
                 await _stream_stdin(proc, stdin, self._STDIN_CHUNK_SIZE)
-            data = await proc.stdout.read.aio() if capture else None
             exit_code = await proc.wait.aio()
             if fail_label and exit_code != 0:
-                detail = "" if capture else f": {await proc.stderr.read.aio()}"
-                raise RuntimeError(f"Modal {fail_label} failed (exit {exit_code}){detail}")
-            return data
+                raise RuntimeError(f"Modal {fail_label} failed (exit {exit_code}): {await proc.stderr.read.aio()}")
         return self._worker.run_coroutine(_run(), timeout=timeout)
 
     def _modal_upload(self, host_path: str, remote_path: str) -> None:
@@ -224,8 +219,20 @@ class ModalEnvironment(BaseEnvironment):
     def _modal_bulk_download(self, dest: Path) -> None:
         """Download remote .hermes/ as a tar archive (sandboxes run as root, so /root/.hermes)."""
         # --exclude: live sockets cannot be archived ("socket ignored") and must not fail the download.
-        data = self._exec("tar cf - --exclude='*.sock' -C / root/.hermes", timeout=120, fail_label="bulk download", capture=True)
-        dest.write_bytes(data.encode() if isinstance(data, str) else data)
+        async def download():
+            proc = await self._sandbox.exec.aio("bash", "-c", "tar cf - --exclude='*.sock' -C / root/.hermes",
+                                                text=False, timeout=120)
+            with sync_back_writer(dest) as write:
+                try:
+                    async for chunk in proc.stdout:
+                        write(chunk)
+                finally:
+                    await proc.stdout.aclose()
+            exit_code = await proc.wait.aio()
+            if exit_code != 0:
+                raise RuntimeError(f"Modal bulk download failed (exit {exit_code})")
+
+        self._worker.run_coroutine(asyncio.wait_for(download(), timeout=120), timeout=125)
 
     def _modal_delete(self, remote_paths: list[str]) -> None:
         self._exec(quoted_rm_command(remote_paths), timeout=15)

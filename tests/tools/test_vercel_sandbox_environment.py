@@ -58,8 +58,7 @@ class _FakeSandbox:
         self.run_command_side_effects: list[object] = []
         self.write_files_calls: list[list[dict[str, object]]] = []
         self.write_files_side_effects: list[object] = []
-        self.download_file_calls: list[tuple[str, Path]] = []
-        self.download_file_side_effects: list[object] = []
+        self.download_file_calls: list[str] = []
         self.download_file_content = b""
         self.stop_calls: list[tuple[tuple, dict]] = []
         self.snapshot_calls: list[tuple[tuple, dict]] = []
@@ -110,17 +109,9 @@ class _FakeSandbox:
             if callable(effect):
                 effect(files)
 
-    def download_file(self, remote_path: str, local_path) -> str:
-        destination = Path(local_path)
-        self.download_file_calls.append((remote_path, destination))
-        if self.download_file_side_effects:
-            effect = self.download_file_side_effects.pop(0)
-            if isinstance(effect, Exception):
-                raise effect
-            if callable(effect):
-                return effect(remote_path, destination)
-        destination.write_bytes(self.download_file_content)
-        return str(destination.resolve())
+    def iter_file(self, remote_path: str):
+        self.download_file_calls.append(remote_path)
+        yield self.download_file_content
 
     def stop(self, *args, **kwargs) -> None:
         self.stop_calls.append((args, kwargs))
@@ -401,6 +392,17 @@ class TestFileSync:
         assert len(sandbox.stop_calls) == 1  # always stop after snapshot to avoid resource leaks
         assert sandbox.closed == 1
         assert vercel_module._load_snapshots() == {"task-123": "snap_cleanup"}
+
+    def test_bulk_download_limits_actual_bytes(self, make_env, vercel_sdk, tmp_path, monkeypatch):
+        from tools.environments.file_sync import SyncBackSizeLimitExceeded
+
+        monkeypatch.setattr("tools.environments.file_sync._sync_back_max_bytes", lambda: 3)
+        env = make_env()
+        vercel_sdk.current.download_file_content = b"hello"
+        destination = tmp_path / "out"
+        with pytest.raises(SyncBackSizeLimitExceeded):
+            env._vercel_bulk_download(destination)
+        assert destination.stat().st_size <= 3
 
     def test_cleanup_sync_back_failure_from_download_does_not_block_snapshot(
         self, make_env, vercel_sdk, monkeypatch, tmp_path

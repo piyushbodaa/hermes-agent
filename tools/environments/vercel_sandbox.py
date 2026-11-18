@@ -25,7 +25,7 @@ from hermes_cli.config_defaults import DEFAULT_VERCEL_IMAGE
 from hermes_constants import get_hermes_home
 from tools.environments.base import BaseEnvironment, _load_json_store, _update_json_store
 from tools.environments.base_output import _ThreadedProcessHandle
-from tools.environments.file_sync import FileSyncManager, iter_sync_files, quoted_rm_command
+from tools.environments.file_sync import FileSyncManager, iter_sync_files, quoted_rm_command, sync_back_writer
 
 logger = logging.getLogger(__name__)
 
@@ -338,7 +338,9 @@ class VercelSandboxEnvironment(BaseEnvironment):
             # --exclude: live sockets cannot be archived ("socket ignored") and must not fail the download.
             self._run_checked(f"tar cf {shlex.quote(remote_tar)} --exclude='*.sock' -C / {shlex.quote(archive_member)}",
                               "bulk download")
-            sandbox.download_file(remote_tar, dest_tar_path)
+            with sync_back_writer(dest_tar_path) as write, contextlib.closing(sandbox.iter_file(remote_tar)) as chunks:
+                for chunk in chunks:
+                    write(chunk)
         finally:
             with contextlib.suppress(Exception):
                 sandbox.run_command("bash", ["-lc", f"rm -f {shlex.quote(remote_tar)}"], cwd=self._workspace_root)

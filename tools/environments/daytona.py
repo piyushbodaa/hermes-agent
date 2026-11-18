@@ -15,7 +15,7 @@ from pathlib import Path, PurePosixPath
 from tools.environments.base import BaseEnvironment
 from tools.environments.base_output import _ThreadedProcessHandle
 from tools.environments.file_sync import (
-    FileSyncManager, iter_sync_files, quoted_mkdir_command, quoted_rm_command, unique_parent_dirs)
+    FileSyncManager, iter_sync_files, quoted_mkdir_command, quoted_rm_command, sync_back_writer, unique_parent_dirs)
 from tools.environments.remote_common import ensure_lazy_dep
 
 logger = logging.getLogger(__name__)
@@ -116,11 +116,27 @@ class DaytonaEnvironment(BaseEnvironment):
         # PID-suffixed remote temp path avoids collisions if sync_back runs concurrently.
         remote_tar = f"/tmp/.hermes_sync.{os.getpid()}.tar"  # no-tmp: ok — remote sandbox path
         # --exclude: live sockets cannot be archived ("socket ignored") and must not fail the download.
-        self._sandbox.process.exec(
-            f"tar cf {shlex.quote(remote_tar)} --exclude='*.sock' -C / {shlex.quote(rel_base)}")
-        self._sandbox.fs.download_file(remote_tar, str(dest))
-        with contextlib.suppress(Exception):  # best-effort cleanup
-            self._sandbox.process.exec(f"rm -f {shlex.quote(remote_tar)}")
+        try:
+            result = self._sandbox.process.exec(
+                f"tar cf {shlex.quote(remote_tar)} --exclude='*.sock' -C / {shlex.quote(rel_base)}")
+            if result.exit_code != 0:
+                raise RuntimeError(f"Daytona tar creation failed (exit {result.exit_code})")
+            # The high-level download_file writes to a path without a size limit.
+            # Its configured toolbox client also exposes the underlying binary response.
+            with sync_back_writer(dest) as write:
+                response = self._sandbox.fs._api_client.download_file_without_preload_content(
+                    path=remote_tar, _request_timeout=120.0, _headers={"Accept-Encoding": "identity"})
+                try:
+                    if response.status != 200:
+                        raise RuntimeError(f"Daytona archive download failed (HTTP {response.status})")
+                    for chunk in response.stream(64 * 1024, decode_content=False):
+                        write(chunk)
+                finally:
+                    response.close()
+                    response.release_conn()
+        finally:
+            with contextlib.suppress(Exception):
+                self._sandbox.process.exec(f"rm -f {shlex.quote(remote_tar)}")
 
     def _daytona_delete(self, remote_paths: list[str]) -> None:
         self._sandbox.process.exec(quoted_rm_command(remote_paths))

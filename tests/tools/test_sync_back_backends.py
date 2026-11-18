@@ -1,6 +1,8 @@
 """Tests for backend-specific bulk download implementations and cleanup() wiring."""
 
 import asyncio
+import io
+import sys
 import subprocess
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -54,8 +56,9 @@ def _wire_modal_download(env, *, tar_bytes=b"fake-tar-data", exit_code=0):
         exec_calls.append(args)
         proc = MagicMock()
         proc.stdout = MagicMock()
-        proc.stdout.read = MagicMock()
-        proc.stdout.read.aio = AsyncMock(return_value=tar_bytes)
+        assert kwargs["text"] is False
+        proc.stdout.__aiter__.return_value = [tar_bytes]
+        proc.stdout.aclose = AsyncMock()
         proc.wait = MagicMock()
         proc.wait.aio = AsyncMock(return_value=exit_code)
         return proc
@@ -79,6 +82,10 @@ def _make_mock_daytona_env():
     """Create a minimal DaytonaEnvironment without calling __init__."""
     env = object.__new__(daytona_env.DaytonaEnvironment)
     env._sandbox = MagicMock()
+    env._sandbox.process.exec.return_value.exit_code = 0
+    response = env._sandbox.fs._api_client.download_file_without_preload_content.return_value
+    response.status = 200
+    response.stream.return_value = [b"archive"]
     env._remote_home = "/root"
     env._sync_manager = None
     env._lock = __import__("threading").Lock()
@@ -91,6 +98,15 @@ def _make_mock_daytona_env():
 # SSH bulk download
 # =====================================================================
 
+def _mock_ssh_tar(completed):
+    process = MagicMock()
+    process.stdout = io.BytesIO(completed.stdout or b"")
+    process.stderr = io.BytesIO(completed.stderr or b"")
+    process.wait.return_value = completed.returncode
+    process.__enter__.return_value = process
+    return patch.object(subprocess, "Popen", return_value=process)
+
+
 class TestSSHBulkDownload:
     """Unit tests for _ssh_bulk_download."""
 
@@ -98,8 +114,7 @@ class TestSSHBulkDownload:
         """subprocess.run command should include tar cf - over SSH."""
         dest = tmp_path / "backup.tar"
 
-        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as mock_run:
-            # open() will be called to write stdout; mock it to avoid actual file I/O
+        with _mock_ssh_tar(subprocess.CompletedProcess([], 0)) as mock_run:
             ssh_mock_env._ssh_bulk_download(dest)
 
         mock_run.assert_called_once()
@@ -111,6 +126,22 @@ class TestSSHBulkDownload:
         assert "ssh" in cmd_str
         assert "testuser@example.com" in cmd_str
 
+    @pytest.mark.parametrize(("limit", "accepted"), [(4, False), (5, True)])
+    def test_ssh_limits_actual_transfer(self, ssh_mock_env, tmp_path, monkeypatch, limit, accepted):
+        from tools.environments.file_sync import SyncBackSizeLimitExceeded
+
+        monkeypatch.setattr("tools.environments.file_sync._sync_back_max_bytes", lambda: limit)
+        monkeypatch.setattr(ssh_mock_env, "_build_ssh_command",
+                            lambda: [sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'hello')"])
+        destination = tmp_path / "out"
+        if accepted:
+            ssh_mock_env._ssh_bulk_download(destination)
+            assert destination.read_bytes() == b"hello"
+        else:
+            with pytest.raises(SyncBackSizeLimitExceeded):
+                ssh_mock_env._ssh_bulk_download(destination)
+            assert destination.stat().st_size <= limit
+
     def test_ssh_bulk_download_tolerates_only_socket_ignored_exit_2(self, ssh_mock_env, tmp_path):
         """Live sockets are excluded up front, and an rc=2 whose stderr is solely
         'socket ignored' lines (a socket not named *.sock) does not fail the transfer."""
@@ -118,7 +149,7 @@ class TestSSHBulkDownload:
         stderr = b"tar: home/testuser/.hermes/gateway.sock: socket ignored\n"
         completed = subprocess.CompletedProcess([], 2, stderr=stderr)
 
-        with patch.object(subprocess, "run", return_value=completed) as mock_run:
+        with _mock_ssh_tar(completed) as mock_run:
             ssh_mock_env._ssh_bulk_download(dest)  # must not raise
 
         assert "--exclude='*.sock'" in " ".join(mock_run.call_args[0][0])
@@ -136,7 +167,7 @@ class TestSSHBulkDownload:
             subprocess.CompletedProcess([], 2, stderr=b"tar: socket ignored dir/state.db: Cannot open: Permission denied\n"),
         )
         for completed in failures:
-            with patch.object(subprocess, "run", return_value=completed):
+            with _mock_ssh_tar(completed):
                 with pytest.raises(EnvironmentConnectionError):
                     ssh_mock_env._ssh_bulk_download(dest)
 
@@ -198,6 +229,7 @@ class TestModalBulkDownload:
 
         env._modal_bulk_download(dest)
 
+        assert dest.read_bytes() == b"tar-content"
         assert len(exec_calls) == 1
         args = exec_calls[0]
         assert args[0] == "bash"
@@ -265,12 +297,13 @@ class TestDaytonaBulkDownload:
         assert "rm -f" in cleanup_cmd
         assert "/tmp/.hermes_sync." in cleanup_cmd
 
-        # download_file called once with the same PID-suffixed path
-        env._sandbox.fs.download_file.assert_called_once()
-        download_args = env._sandbox.fs.download_file.call_args[0]
-        assert download_args[0].startswith("/tmp/.hermes_sync.")
-        assert download_args[0].endswith(".tar")
-        assert download_args[1] == str(dest)
+        download = env._sandbox.fs._api_client.download_file_without_preload_content
+        download.assert_called_once()
+        assert download.call_args.kwargs["path"].startswith("/tmp/.hermes_sync.")
+        assert download.call_args.kwargs["path"].endswith(".tar")
+        assert dest.read_bytes() == b"archive"
+        download.return_value.close.assert_called_once()
+        download.return_value.release_conn.assert_called_once()
 
     def test_daytona_bulk_download_uses_remote_home(self, tmp_path):
         """The tar command should use the env's _remote_home."""
@@ -282,6 +315,24 @@ class TestDaytonaBulkDownload:
 
         tar_cmd = env._sandbox.process.exec.call_args_list[0][0][0]
         assert "home/daytona/.hermes" in tar_cmd
+
+@pytest.mark.parametrize("backend", ["daytona", "modal"])
+def test_sdk_transfer_checks_real_bytes(tmp_path, monkeypatch, backend):
+    from tools.environments.file_sync import SyncBackSizeLimitExceeded
+
+    monkeypatch.setattr("tools.environments.file_sync._sync_back_max_bytes", lambda: 3)
+    if backend == "modal":
+        env = _make_mock_modal_env()
+        _wire_modal_download(env, tar_bytes=b"hello")
+        download = env._modal_bulk_download
+    else:
+        env = _make_mock_daytona_env()
+        download = env._daytona_bulk_download
+    destination = tmp_path / "out"
+    with pytest.raises(SyncBackSizeLimitExceeded):
+        download(destination)
+    assert destination.stat().st_size <= 3
+
 
 class TestDaytonaCleanup:
     """Verify Daytona cleanup() calls sync_back() before stop."""

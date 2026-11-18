@@ -5,6 +5,7 @@ remote environments transactionally.  Used by SSH, Modal, and Daytona.
 Docker and Singularity use bind mounts (live host FS view) and don't need this.
 """
 
+from contextlib import contextmanager
 import hashlib
 import logging
 import os
@@ -23,7 +24,7 @@ try:
 except ImportError:
     fcntl = None  # Windows — file locking skipped
 from pathlib import Path, PurePosixPath
-from typing import Callable
+from typing import Callable, Iterator
 
 import psutil
 
@@ -68,7 +69,7 @@ _SYNC_BACK_STALE_SECONDS = 30 * 60
 
 
 def _sync_back_max_bytes() -> int:
-    """Extraction cap; config.yaml ``terminal.sync_back_max_bytes`` overrides it for trees that
+    """Download and extraction cap; config.yaml ``terminal.sync_back_max_bytes`` overrides it for trees that
     legitimately exceed 2 GiB (a skipped extraction silently discards the whole download)."""
     from hermes_cli.config import load_config
 
@@ -79,6 +80,23 @@ def _sync_back_max_bytes() -> int:
         except (TypeError, ValueError):
             logger.warning("sync_back: ignoring non-integer terminal.%s=%r", _SYNC_BACK_MAX_BYTES_KEY, raw)
     return _SYNC_BACK_MAX_BYTES
+
+
+class SyncBackSizeLimitExceeded(ValueError):
+    """The live remote transfer reached the operator's configured byte limit."""
+
+
+@contextmanager
+def sync_back_writer(destination: Path) -> Iterator[Callable[[bytes], None]]:
+    """Yield a writer that checks every chunk before storing it on the host."""
+    limit = _sync_back_max_bytes()
+    with destination.open("wb") as output:
+        def write(chunk: bytes) -> None:
+            if output.tell() + len(chunk) > limit:
+                raise SyncBackSizeLimitExceeded(f"remote archive exceeds the {limit}-byte cap")
+            output.write(chunk)
+
+        yield write
 
 
 def _extract_sync_back_archive(archive: str, staging: str, max_bytes: int) -> bool:
@@ -386,6 +404,9 @@ class FileSyncManager:
         for attempt in range(_SYNC_BACK_MAX_RETRIES):
             try:
                 self._sync_back_once(lock_path)
+                return
+            except SyncBackSizeLimitExceeded as exc:
+                logger.warning("sync_back: skipping remote archive: %s", exc)
                 return
             except Exception as exc:
                 last_exc = exc

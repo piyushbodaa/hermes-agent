@@ -15,6 +15,7 @@ import pytest
 
 from tools.environments.file_sync import (
     FileSyncManager,
+    sync_back_writer,
     _cleanup_stale_sync_back_temp,
     _extract_sync_back_archive,
     _sha256_file,
@@ -407,6 +408,25 @@ class TestSyncBackSizeCap:
         # Warning should mention the cap
         assert any("cap" in r.message for r in caplog.records)
 
+
+    def test_over_budget_transfer_is_discarded_once(self, tmp_path, monkeypatch):
+        host = tmp_path / "skill.md"
+        _write_file(host, b"original")
+        remote = "/root/.hermes/skill.md"
+        attempted = []
+
+        def download(destination):
+            attempted.append(destination)
+            with sync_back_writer(destination) as write:
+                write(b"one")
+                write(b"two")
+
+        monkeypatch.setattr("tools.environments.file_sync._sync_back_max_bytes", lambda: 5)
+        mgr = _make_manager(tmp_path, [(str(host), remote)], bulk_download_fn=download)
+        mgr.sync_back(hermes_home=tmp_path / ".hermes")
+        assert len(attempted) == 1
+        assert not attempted[0].exists()
+        assert host.read_bytes() == b"original"
 
     @pytest.mark.parametrize(("limit", "accepted"), [(5, False), (6, True)])
     def test_logical_cap_counts_every_synced_name(self, tmp_path, limit, accepted):
