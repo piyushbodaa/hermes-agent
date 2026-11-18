@@ -520,7 +520,7 @@ def test_timed_out_probe_is_killed_with_its_whole_process_tree(tmp_path, perl):
     assert found
     run_bounded = found.group(0)
     pidfile = tmp_path / "grandchild.pid"
-    env = {**os.environ, "TMPDIR": str(tmp_path)}
+    env = {**os.environ, "RUN_DIR": str(tmp_path)}
     if perl == "absent":  # a minimal image: only the tools the probe itself needs
         bin_dir = tmp_path / "bin"; bin_dir.mkdir()
         for tool in ("bash", "sleep", "mktemp", "rm", "cat"):

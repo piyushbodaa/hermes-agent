@@ -96,13 +96,31 @@ TARGET_ARGS=(--branch "$BRANCH")
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HERMES_HOME="${HERMES_HOME:-${INSTALL_ROOT:+$(dirname "$INSTALL_ROOT")}}"
-HERMES_HOME="${HERMES_HOME:-${TMPDIR:-/tmp}}"
+SELF_TEST_HOME=""
+if [ -z "$HERMES_HOME" ]; then
+  # Standalone UI/swap self-tests have no installation or process home.
+  SELF_TEST_HOME="$(mktemp -d "${TMPDIR:-/tmp}/hermes-update-test.XXXXXXXX")" || exit 70
+  HERMES_HOME="$SELF_TEST_HOME"
+fi
 export HERMES_HOME
 MARKER="$HERMES_HOME/.hermes-update-in-progress"
 LOG_DIR="$HERMES_HOME/logs"; mkdir -p "$LOG_DIR" 2>/dev/null || true
 LOG="$LOG_DIR/desktop-update-handoff.log"
 RESULT="$HERMES_HOME/.hermes-update-result.json"
-STATUS="${TMPDIR:-/tmp}/hermes-update-status.$$"
+RUN_DIR="" STATUS=""
+setup_run_dir() {
+  local dir
+  dir="$(cd "$HERMES_HOME" && mktemp -d "$PWD/.hermes-update-run.$$.XXXXXXXX")" || {
+    log "Could not allocate a private desktop update directory."
+    return 1
+  }
+  RUN_DIR="$dir"
+  STATUS="$RUN_DIR/status"
+}
+cleanup_run_dir() {
+  [ -z "$RUN_DIR" ] || rm -rf "$RUN_DIR"
+  [ -z "$SELF_TEST_HOME" ] || rm -rf "$SELF_TEST_HOME"
+}
 STARTED_AT="$(date +%s)"  # the shim's elapsed clock; see serve-ui.py
 # Separate identity from both heartbeat time and adopt-only HANDOFF_RUN.
 # Old Desktop / direct launches need an ID too, without changing claim rules.
@@ -205,7 +223,7 @@ marker_refresher_stop() {
 run_bounded() { # seconds cmd... -> cmd's stdout; 124 when it had to be killed
   local secs="$1" out pid i rc
   shift
-  out="$(mktemp "${TMPDIR:-/tmp}/hermes-update-probe.$$.XXXXXX")" || return 1
+  out="$(mktemp "$RUN_DIR/probe.XXXXXX")" || return 1
   # Its own process group (pgid = pid), so a timeout kills the probe's whole
   # tree -- a hung `hermes` launcher's python child included, not just the shell.
   if command -v perl >/dev/null 2>&1; then
@@ -350,6 +368,7 @@ notify_fallback() { # status message — renderer-free recovery surface.
 }
 
 write_status() { # status message -- atomic replace; the server reads per poll
+  [ -n "$STATUS" ] || return 0
   printf '{"status":"%s","message":"%s"}' "$(json_escape "$1")" "$(json_escape "$2")" > "$STATUS.tmp" \
     && mv -f "$STATUS.tmp" "$STATUS" 2>/dev/null || true
 }
@@ -444,7 +463,7 @@ start_ui() {
   fi
   { [ -f "$html" ] && [ -n "$py" ] && [ -n "$browser" ]; } || { log "shim: no renderer; skipping UI"; return; }
 
-  UI_PROFILE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/hermes-update-ui-$$-XXXXXXXX")" || {
+  UI_PROFILE_DIR="$(mktemp -d "$RUN_DIR/browser.XXXXXXXX")" || {
     UI_PROFILE_DIR=""
     log "shim: could not allocate a browser profile; skipping UI"
     return
@@ -693,13 +712,12 @@ launch_app() { # attempted BEFORE the terminal event (launch acceptance is
     # spawn, then confirm the child is still alive shortly after — an
     # immediate exec failure (ENOENT, ELF mismatch, dead sandbox) dies
     # within the window and downgrades to manual instead of lying.
-    (cd "${RELAUNCH_CWD:-/}" 2>/dev/null || cd /
+    local lp
+    lp="$(cd "${RELAUNCH_CWD:-/}" 2>/dev/null || cd /
      # The relaunched app must not inherit the hand-off's update env.
      env -u HERMES_UPDATE_STATUS_FILE -u HERMES_UPDATE_STARTED_AT -u HERMES_UPDATE_HANDOFF_PID -u PYTHONUNBUFFERED \
        setsid "$RELAUNCH_TARGET" ${RELAUNCH_ARGS[@]+"${RELAUNCH_ARGS[@]}"} >/dev/null 2>&1 &
-     echo $! > "$STATUS.launchpid") || { log "WARNING: relaunch spawn failed"; return 1; }
-    local lp
-    lp="$(cat "$STATUS.launchpid" 2>/dev/null)"; rm -f "$STATUS.launchpid" 2>/dev/null
+     echo $!)" || { log "WARNING: relaunch spawn failed"; return 1; }
     [ -n "$lp" ] || { log "WARNING: relaunch pid unknown"; return 1; }
     sleep 1.5
     kill -0 "$lp" 2>/dev/null || { log "WARNING: relaunched app exited immediately"; return 1; }
@@ -751,7 +769,6 @@ finish() {
   if [ "$FINAL_CODE" -ne 0 ]; then
     publish "error" "$FINAL_MSG"; stop_ui leave-window
     launch_app || true   # error path still tries to bring the app back
-    rm -f "$STATUS" "$STATUS.tmp" "$STATUS.port" 2>/dev/null || true
     return
   fi
 
@@ -778,9 +795,8 @@ finish() {
     write_result
     publish "manual" "$FINAL_MSG"; stop_ui leave-window
   fi
-  rm -f "$STATUS" "$STATUS.tmp" "$STATUS.port" 2>/dev/null || true
 }
-trap finish EXIT
+trap 'finish; cleanup_run_dir' EXIT
 
 # ── legacy macOS TCC anchor self-heal (#95759) ──────────────────────────────
 # The reverted TCC interpreter anchor (#95425/#95541) left some installs with
@@ -932,7 +948,7 @@ if [ "$SELF_TEST_SWAP" -eq 1 ]; then
   # checks the REAL mac_bundle_recover; never touches an installed app.
   # tests/scripts/desktop_update/test_desktop_update_mac_swap_interrupt.py runs
   # it on Linux and on the macOS lane of tests-os.yml.
-  trap - EXIT
+  trap cleanup_run_dir EXIT
   # shellcheck source=swap-selftest.sh
   . "$SCRIPT_DIR/swap-selftest.sh"
   swap_selftest
@@ -949,6 +965,7 @@ if [ "$SELF_TEST_GATE" -eq 1 ]; then
 fi
 
 if [ "$SELF_TEST_UI" -eq 1 ]; then
+  setup_run_dir || { trap cleanup_run_dir EXIT; exit 70; }
   start_ui
   log "SELF-TEST: shim simulation (no update will run)"
   sleep "${HERMES_SELFTEST_HOLD_SECONDS:-6}"
@@ -1053,24 +1070,26 @@ if [ "$SELF_TEST_MARKER" -eq 1 ]; then
   trap - EXIT
   exit 0
 fi
+if ! setup_run_dir; then
+  FINAL_CODE=70 FINAL_MSG="Update aborted: could not allocate a private desktop update directory."
+  exit "$FINAL_CODE"
+fi
 marker_refresher_start
 
 # Start-of-run recovery of litter only a dead hand-off can leave (we hold the
 # marker, so no other hand-off is running): an interrupted app swap, a TCC heal
-# backup of a killed run, UI/probe temp files whose owning pid is gone.
+# backup of a killed run, and private run directories whose owning pid is gone.
 case "$RELAUNCH_TARGET" in *.app) mac_bundle_recover "$RELAUNCH_TARGET" ;; esac
 for _stale in "$INSTALL_ROOT"/venv/bin/*.tcc-heal-old.* "$INSTALL_ROOT"/venv/bin/*.tcc-heal-new.* \
-    "${TMPDIR:-/tmp}"/hermes-update-status.[0-9]* "${TMPDIR:-/tmp}"/hermes-update-probe.[0-9]* \
-    "${TMPDIR:-/tmp}"/hermes-update-go.[0-9]* \
-    "${TMPDIR:-/tmp}"/hermes-update-ui-[0-9]*-*; do
+    "$HERMES_HOME"/.hermes-update-run.[0-9]*.*; do
   [ -e "$_stale" ] || [ -L "$_stale" ] || continue
-  case "$_stale" in
-    *.tcc-heal-*) _owner="${_stale##*.}" ;;
-    *) _owner="$(printf '%s' "${_stale##*/}" | sed -n 's/^[^0-9]*\([0-9][0-9]*\).*/\1/p')" ;;
+  case "${_stale##*/}" in
+    .hermes-update-run.*) _owner="${_stale##*/.hermes-update-run.}"; _owner="${_owner%%.*}" ;;
+    *) _owner="${_stale##*.}" ;;
   esac
   case "$_owner" in ''|*[!0-9]*) continue ;; esac
   { [ "$_owner" != "$$" ] && ! pid_alive "$_owner"; } || continue
-  case "$_stale" in
+  case "${_stale##*/}" in
     *.tcc-heal-old.*)
       _orig="${_stale%.tcc-heal-old.*}"
       if [ ! -e "$_orig" ] && [ ! -L "$_orig" ]; then
@@ -1202,17 +1221,20 @@ run_update() { # streams straight into the log (a killed run keeps its output);
   # but the marker names neither a live owner nor a live delegate. A
   # HUP/INT/QUIT that lands meanwhile is handled once it exits, exactly like a
   # foreground child.
-  local offset pid sig go="${TMPDIR:-/tmp}/hermes-update-go.$$"
+  local offset pid sig go="$RUN_DIR/go"
   offset="$(wc -c < "$LOG" 2>/dev/null | tr -d '[:space:]')"
+  if ! rm -f "$go"; then
+    CODE=3 OUT=""
+    log "update aborted: could not reset the child release signal"
+    return
+  fi
   PENDING_SIGNAL=""
   for sig in HUP INT QUIT; do trap "PENDING_SIGNAL=\${PENDING_SIGNAL:-$sig}" "$sig"; done
-  rm -f "$go" 2>/dev/null
   ( trap - TERM
     while [ ! -e "$go" ]; do kill -0 $$ 2>/dev/null || exit 70; sleep 0.05; done
     exec "${UPDATE_INVOKE[@]}" update --yes $GATEWAY_FLAG $KEEP_STASH "${TARGET_ARGS[@]}" ) >> "$LOG" 2>&1 <&0 &
   pid=$!
-  if marker_add_delegate "$pid"; then
-    : > "$go"
+  if marker_add_delegate "$pid" && : > "$go"; then
     while :; do
       wait "$pid"; CODE=$?
       [ "$CODE" -ne 127 ] || break          # not our child any more
@@ -1224,7 +1246,7 @@ run_update() { # streams straight into the log (a killed run keeps its output);
     kill -KILL "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
     CODE=3
-    log "update aborted: could not publish the update child as our marker delegate"
+    log "update aborted: could not publish and release the update child as our marker delegate"
   fi
   rm -f "$go" 2>/dev/null
   for sig in HUP INT QUIT; do trap "on_signal $sig" "$sig"; done

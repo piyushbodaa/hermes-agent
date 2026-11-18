@@ -41,7 +41,8 @@ def _assert_running(payload: str, message: str) -> None:
     assert data["message"] == message
 
 
-def test_publishes_through_exported_env_var(status_file, monkeypatch):
+def test_publishes_through_exported_env_var(tmp_path, monkeypatch):
+    status_file = tmp_path / "status"
     monkeypatch.setenv(update_stage.STATUS_FILE_ENV, str(status_file))
 
     update_stage.publish_stage("Building the web UI")
@@ -49,8 +50,10 @@ def test_publishes_through_exported_env_var(status_file, monkeypatch):
     _assert_running(status_file.read_text(encoding="utf-8"), "Building the web UI")
 
 
-def test_marker_fallback_covers_the_old_shim(status_file, tmp_path, monkeypatch):
-    """The old→new transition: no env var, but the marker names the shim pid.
+@pytest.mark.skipif(os.name != "posix", reason="POSIX hand-off files")
+@pytest.mark.parametrize("exported", [False, True])
+def test_legacy_stage_discovery(status_file, tmp_path, monkeypatch, exported):
+    """The old→new transition: the legacy path comes from the environment or marker.
 
     The shim's status file is ${TMPDIR}/hermes-update-status.<shim pid> and
     the marker's first line IS that pid (update_lock adopts, never rewrites).
@@ -61,12 +64,48 @@ def test_marker_fallback_covers_the_old_shim(status_file, tmp_path, monkeypatch)
     status_file.write_text('{"status":"running","message":"old"}', encoding="utf-8")
     monkeypatch.setenv("TMPDIR", str(tmp_path))
 
+    if exported:
+        monkeypatch.setenv(update_stage.STATUS_FILE_ENV, str(status_file))
     update_stage.publish_stage("Updating Python dependencies (PM)")
 
     _assert_running(status_file.read_text(encoding="utf-8"),
                     "Updating Python dependencies (PM)")
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX hand-off files")
+@pytest.mark.parametrize("exported", [False, True])
+@pytest.mark.parametrize("unsafe", ["symlink", "hardlink", "writable-file", "unsafe-parent", "foreign-owner"])
+def test_untrusted_legacy_status_is_ignored(tmp_path, monkeypatch, exported, unsafe):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / update_stage.MARKER_NAME).write_text("80335\n", encoding="utf-8")
+    scratch = tmp_path / "scratch"
+    scratch.mkdir(mode=0o700)
+    monkeypatch.setenv("TMPDIR", str(scratch))
+    status = scratch / "hermes-update-status.80335"
+    if exported:
+        monkeypatch.setenv(update_stage.STATUS_FILE_ENV, str(status))
+    if unsafe in ("symlink", "hardlink"):
+        target = tmp_path / "regular-fixture"
+        target.write_text("fixture", encoding="utf-8")
+        if unsafe == "symlink":
+            status.symlink_to(target)
+        else:
+            os.link(target, status)
+    else:
+        status.write_text("fixture", encoding="utf-8")
+        if unsafe == "writable-file":
+            scratch.chmod(0o1777)
+            status.chmod(0o666)
+        elif unsafe == "unsafe-parent":
+            scratch.chmod(0o777)
+        else:
+            monkeypatch.setattr(os, "geteuid", lambda: status.stat().st_uid + 1)
+    assert update_stage.status_file() is None
+    update_stage.publish_stage("Building products")
+    assert status.read_text(encoding="utf-8") == "fixture"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX hand-off files")
 def test_marker_fallback_uses_the_platform_home_without_env_var(status_file, tmp_path, monkeypatch):
     """The shim without HERMES_HOME resolved the platform default, which is not ~/.hermes
     on every host (sudo invoker, data-dir suffix); the marker must be looked up there."""

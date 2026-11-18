@@ -7,7 +7,7 @@ PM sync / build stages they drive) can run for minutes with nothing on
 screen. These helpers let long stages publish through the same file so the
 window keeps moving.
 
-Two discovery paths, because the status file's name embeds the shim's pid:
+There are two discovery paths:
 
 - ``HERMES_UPDATE_STATUS_FILE``: exported by the current posix.sh — covers
   new-shim → new-children directly.
@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import tempfile
 from pathlib import Path
 
@@ -45,7 +46,11 @@ def status_file() -> Path | None:
     """The watching shim's status file, or None when no UI is discoverable."""
     exported = os.environ.get(STATUS_FILE_ENV, "").strip()
     if exported:
-        return Path(exported)
+        path = Path(exported)
+        # Older shims also exported their predictable shared-temp path.
+        if path.name.startswith("hermes-update-status.") and path.suffix[1:].isdigit():
+            return _legacy_status(path)
+        return path
     return _status_from_marker()
 
 
@@ -54,8 +59,8 @@ def _status_from_marker() -> Path | None:
 
     The marker's first line is the hand-off shim's ``$$`` (update_lock.py
     adopts rather than rewrites it, so it still names the shim here). The
-    shim's status file lives beside it, pid-suffixed. No marker (plain CLI
-    update) or no matching file → no UI.
+    old shim writes a pid-suffixed status file in its temp directory. With
+    no marker or no trustworthy matching file, there is no UI to update.
     """
     try:
         pid = int((_process_home() / MARKER_NAME).read_text(encoding="utf-8-sig")
@@ -66,7 +71,29 @@ def _status_from_marker() -> Path | None:
         return None
     # The shim writes beside ${TMPDIR:-/tmp}; gettempdir() resolves the same way.
     candidate = Path(tempfile.gettempdir()) / f"hermes-update-status.{pid}"
-    return candidate if candidate.is_file() else None
+    return _legacy_status(candidate)
+
+
+def _legacy_status(path: Path) -> Path | None:
+    """Trust an old shim's regular file only while other users cannot replace or edit it."""
+    if os.name != "posix":
+        return None
+    try:
+        directory = path.parent.stat()
+        entry = path.lstat()
+    except OSError:
+        return None
+    uid = os.geteuid()
+    # A shared system temp directory protects its entries with the sticky bit.
+    if directory.st_uid not in (uid, 0) or (
+        directory.st_mode & 0o022 and not directory.st_mode & stat.S_ISVTX
+    ):
+        return None
+    if not stat.S_ISREG(entry.st_mode) or entry.st_uid != uid or entry.st_nlink != 1:
+        return None
+    if entry.st_mode & 0o022 and directory.st_mode & 0o011:
+        return None
+    return path
 
 
 def publish_stage(message: str) -> None:
@@ -81,13 +108,18 @@ def publish_stage(message: str) -> None:
     if path is None:
         return
     payload = json.dumps({"status": "running", "message": message})
+    tmp = None
     try:
         fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".update-stage-")
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(payload)
         os.replace(tmp, path)
     except OSError:
-        pass
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 def _ui_present_in_log(log_text: str) -> bool:
@@ -114,7 +146,8 @@ def ensure_panel(update_root: Path) -> None:
     """
     if os.environ.get(UI_SPAWNED_ENV) or os.name != "posix" or os.uname().sysname != "Darwin":
         return
-    if status_file() is None:
+    status = status_file()
+    if status is None:
         return
     panel = update_root / "scripts" / "desktop-update" / "update-panel.js"
     if not panel.is_file():
@@ -129,7 +162,7 @@ def ensure_panel(update_root: Path) -> None:
         # same way the shim-spawned UI outlives the shim's stages, and it
         # self-exits when the shim publishes a terminal state.
         subprocess.Popen(
-            ["/usr/bin/osascript", "-l", "JavaScript", str(panel), str(status_file())],
+            ["/usr/bin/osascript", "-l", "JavaScript", str(panel), str(status)],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, start_new_session=True,
         )

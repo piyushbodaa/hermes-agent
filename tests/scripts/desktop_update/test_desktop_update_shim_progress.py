@@ -122,10 +122,9 @@ FAKE_HERMES = """#!/usr/bin/env bash
 case "$*" in *--help*) echo "--keep-stash"; exit 0 ;; esac
 n="$(cat "$HERMES_TEST_CALLS" 2>/dev/null || echo 0)"; n=$((n + 1))
 printf '%s' "$n" > "$HERMES_TEST_CALLS"
-for f in "$TMPDIR"/hermes-update-status.[0-9]*; do
-  case "$f" in *.tmp) continue ;; esac
-  cp "$f" "$HERMES_TEST_CAPTURE.$n" 2>/dev/null
-done
+printf '%s' "$HERMES_UPDATE_STATUS_FILE" > "$HERMES_TEST_CAPTURE.path"
+ls -ld "$(dirname "$HERMES_UPDATE_STATUS_FILE")" > "$HERMES_TEST_CAPTURE.mode"
+cp "$HERMES_UPDATE_STATUS_FILE" "$HERMES_TEST_CAPTURE.$n"
 exit "$(cat "$HERMES_TEST_EXITS.$n" 2>/dev/null || echo 0)"
 """
 
@@ -143,9 +142,14 @@ def _run_handoff(tmp_path, exits: dict[int, int]) -> list[dict]:
     for call, code in exits.items():
         (tmp_path / f"exits.{call}").write_text(str(code))
 
+    public_temp = tmp_path / "shared-temp"
+    public_temp.mkdir()
+    public_temp.chmod(0o1777)
+    legacy_entry = public_temp / "hermes-update-status.2147483647"
+    legacy_entry.write_text("unrelated fixture", encoding="utf-8")
     env = {
         **os.environ,
-        "TMPDIR": str(tmp_path),
+        "TMPDIR": str(public_temp),
         "HERMES_TEST_CAPTURE": str(capture),
         "HERMES_TEST_CALLS": str(calls),
         "HERMES_TEST_EXITS": str(tmp_path / "exits"),
@@ -172,7 +176,16 @@ def _run_handoff(tmp_path, exits: dict[int, int]) -> list[dict]:
         time.sleep(0.1)
     assert result.exists(), "hand-off never wrote its result file"
 
-    seen = sorted(tmp_path.glob("seen.*"), key=lambda p: int(p.suffix[1:]))
+    status = Path((tmp_path / "seen.path").read_text(encoding="utf-8"))
+    assert legacy_entry.read_text(encoding="utf-8") == "unrelated fixture"
+    assert (tmp_path / "seen.mode").read_text(encoding="utf-8").startswith("drwx------")
+    assert status.parent.parent == tmp_path
+    assert status.parent.name.startswith(".hermes-update-run.")
+    deadline = time.monotonic() + 10
+    while status.parent.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert not status.parent.exists(), "completed hand-off kept private scratch files"
+    seen = sorted(tmp_path.glob("seen.[0-9]*"), key=lambda p: int(p.suffix[1:]))
 
     return [json.loads(p.read_text()) for p in seen]
 
@@ -198,3 +211,40 @@ def test_retry_gate_publishes_a_distinct_stage(tmp_path):
         "Updating code and dependencies",
         "Retrying update",
     ]
+
+
+@requires_posix_handoff
+def test_private_directory_failure_aborts_before_running_update(tmp_path):
+    install = tmp_path / "checkout"
+    (install / "venv" / "bin").mkdir(parents=True)
+    home = tmp_path / "home"
+    home.mkdir()
+    marker = home / ".hermes-update-in-progress"
+    keep = home / "keep"
+    keep.write_text("fixture", encoding="utf-8")
+    tools = tmp_path / "bin"
+    tools.mkdir()
+    allocator = tools / "mktemp"
+    allocator.write_text(
+        '#!/bin/sh\ncase "$2" in */.hermes-update-run.*) echo "$HERMES_HOME"; exit 1 ;; esac\n'
+        'exec /usr/bin/mktemp "$@"\n', encoding="utf-8",
+    )
+    allocator.chmod(0o755)
+    called = tmp_path / "called"
+    cli = install / "venv" / "bin" / "hermes"
+    cli.write_text('#!/bin/sh\ntouch "$HERMES_TEST_CALLED"\n', encoding="utf-8")
+    cli.chmod(0o755)
+    env = {
+        **os.environ, "HOME": str(home), "HERMES_HOME": str(home), "TMPDIR": str(tmp_path),
+        "PATH": f"{tools}:/usr/bin:/bin", "HERMES_UPDATE_SHIM_GRACE_SECONDS": "0",
+        "HERMES_TEST_CALLED": str(called),
+    }
+    result = subprocess.run(
+        ["bash", str(SHIM_DIR / "posix.sh"), "--daemonized", "--no-ui", "--install-root", str(install)],
+        env=env, cwd=tmp_path, capture_output=True, text=True, timeout=20,
+    )
+    assert result.returncode == 70, result.stdout + result.stderr
+    receipt = json.loads((home / ".hermes-update-result.json").read_text(encoding="utf-8"))
+    assert receipt["ok"] is False and receipt["exit_code"] == 70
+    assert not called.exists() and not marker.exists()
+    assert keep.read_text(encoding="utf-8") == "fixture"

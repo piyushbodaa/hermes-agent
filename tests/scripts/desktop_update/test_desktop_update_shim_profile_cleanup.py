@@ -22,8 +22,15 @@ def test_shim_removes_only_its_owned_profile(tmp_path, outcome):
     browser.chmod(0o755)
     if outcome == "allocation-failed":
         allocator = bin_dir / "mktemp"
-        allocator.write_text('#!/bin/sh\nprintf "%s\\n" "$HOME"\nexit 1\n', encoding="utf-8")
+        allocator.write_text(
+            '#!/bin/sh\ncase "$2" in */browser.*) echo "$HOME"; exit 1 ;; esac\n'
+            'exec /usr/bin/mktemp "$@"\n', encoding="utf-8",
+        )
         allocator.chmod(0o755)
+    # The user's desktop may resolve its browser through D-Bus rather than mimeapps.list.
+    settings = bin_dir / "xdg-settings"
+    settings.write_text('#!/bin/sh\necho google-chrome.desktop\n', encoding="utf-8")
+    settings.chmod(0o755)
     config = tmp_path / ".config"
     config.mkdir()
     (config / "mimeapps.list").write_text(
