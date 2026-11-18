@@ -209,6 +209,15 @@ class TestIRCAdapterMessageParsing:
 
 class TestIRCAdapterSplitting:
 
+    def test_split_refuses_character_larger_than_budget(self):
+        with pytest.raises(ValueError, match="no room"):
+            _irc_mod._chunk_paragraph("あ", 2)
+
+    def test_single_line_encoding_refuses_control_bytes(self):
+        with pytest.raises(ValueError, match="control character"):
+            _irc_mod._encode_line("example\rvalue")
+        assert _irc_mod._encode_line("example") == b"example\r\n"
+
     def test_split_respects_byte_limit(self):
         """Multi-byte characters should not exceed IRC byte limit."""
         # 100 japanese chars = 300 bytes in utf-8

@@ -92,6 +92,8 @@ def _chunk_paragraph(paragraph: str, limit: int) -> list[str]:
                 split_at, low = mid, mid + 1
             else:
                 high = mid - 1
+        if not split_at:
+            raise ValueError("IRC line has no room for the next character")
         space = paragraph.rfind(" ", 0, split_at)
         if space > split_at // 3:
             split_at = space
@@ -110,6 +112,8 @@ def _split_lines(paragraphs, limit: int) -> list[str]:
 
 
 def _encode_line(line: str) -> bytes:
+    if any(c in line for c in ("\r", "\n", "\x00")):
+        raise ValueError("Illegal control character in IRC line")
     return (line + "\r\n").encode("utf-8")
 
 
@@ -215,12 +219,14 @@ class IRCAdapter(BasePlatformAdapter):
                    metadata: Optional[dict[str, Any]] = None):
         if not self._writer or self._writer.is_closing():
             return SendResult(success=False, error="Not connected")
-        for line in self._split_message(content, chat_id):
-            try:
+        try:
+            if not _valid_target(chat_id):
+                return SendResult(success=False, error="Invalid IRC chat_id")
+            for line in self._split_message(content, chat_id):
                 await self._send_raw(f"PRIVMSG {chat_id} :{line}")
                 await asyncio.sleep(0.3)  # Basic flood protection
-            except Exception as e:
-                return SendResult(success=False, error=str(e))
+        except Exception as e:
+            return SendResult(success=False, error=str(e))
         return SendResult(success=True, message_id=_ms_id())
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
@@ -231,7 +237,7 @@ class IRCAdapter(BasePlatformAdapter):
 
     def _split_message(self, content: str, target: str) -> list[str]:
         """Split a long message into IRC-safe chunks (510-byte line limit minus PRIVMSG overhead)."""
-        paragraphs = [p for p in self._strip_markdown(content).split("\n") if p.strip()]
+        paragraphs = [_strip_irc_control_chars(p) for p in self._strip_markdown(content).split("\n") if p.strip()]
         return _split_lines(paragraphs, min(self.max_message_length, _privmsg_budget(target))) or [""]
 
     @staticmethod
@@ -441,6 +447,10 @@ def _strip_irc_control_chars(text: str) -> str:
     return text.replace("\r", " ").replace("\n", " ").replace("\x00", "")
 
 
+def _valid_target(target: str) -> bool:
+    return bool(target and _privmsg_budget(target) > 0 and not any(c.isspace() or c == "\x00" for c in target))
+
+
 def _is_irc_channel(target: str) -> bool:
     return bool(target) and target[0] in "#&+!"
 
@@ -542,8 +552,8 @@ async def _standalone_send(pconfig, chat_id: str, message: str, *, thread_id: Op
     use_tls = use_tls_env.lower() in _TRUTHY if use_tls_env is not None else bool(extra.get("use_tls", True))
     # Reject control characters in chat_id to block IRC command injection.
     target = chat_id or channel
-    if any(ch in target for ch in ("\r", "\n", "\x00", " ")):
-        return _sa_error("chat_id contains illegal IRC characters")
+    if not _valid_target(target):
+        return _sa_error("Invalid IRC chat_id")
     # Cap the base to 24 chars so collision retries stay within the 30-char NICKLEN most networks enforce.
     nick_base = _env_or_extra(extra, "IRC_NICKNAME", "nickname", "hermes-bot").rstrip("_0123456789-")[:24] or "hermes-bot"
     plain = IRCAdapter._strip_markdown(message)
