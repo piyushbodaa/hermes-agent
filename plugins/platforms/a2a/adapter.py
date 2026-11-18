@@ -16,13 +16,13 @@ import socket
 import threading
 import time
 import urllib.parse
-import urllib.request
 from collections import OrderedDict, deque
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FuturesTimeout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional
 
+from agent.proxy_bypass import is_loopback_host
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from gateway.config import Platform
@@ -193,7 +193,24 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
         scheme = (self.headers.get("X-Forwarded-Proto", "") or "http").split(",")[0].strip()
         return f"{scheme}://{host}/" if host else ""
 
+    def _local_request_allowed(self) -> bool:
+        if not self.adapter._security_context.localhost_only():
+            return True
+        host = self.headers.get("Host", "")
+        try:
+            destination = urllib.parse.urlsplit("http://" + host)
+            if destination.netloc != host or destination.username is not None or not is_loopback_host(destination.hostname):
+                return False
+            if self.headers.get("Sec-Fetch-Site", "none").lower() not in {"none", "same-origin"}:
+                return False
+            origin = self.headers.get("Origin")
+            return origin is None or origin.lower() == ("http://" + host).lower()
+        except ValueError:
+            return False
+
     def do_GET(self):
+        if not self._local_request_allowed():
+            return self._error(403, None, protocol.ERR_UNAUTHORIZED, "untrusted local request")
         adapter = self.adapter
         route = adapter._route_for_path(self.path)
         agent = route["agent"]
@@ -213,6 +230,8 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
         self._json(200, payload)
 
     def do_POST(self):
+        if not self._local_request_allowed():
+            return self._error(403, None, protocol.ERR_UNAUTHORIZED, "untrusted local request")
         adapter = self.adapter
         # Identity comes from the credential (or the socket in localhost-only mode) — never the body.
         identity = adapter._security_context.authenticate(self.headers.get("Authorization"), self._client_ip())
@@ -220,6 +239,8 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
             return self._error(401, None, protocol.ERR_UNAUTHORIZED, "unauthorized")
         try:
             length = int(self.headers.get("Content-Length", 0))
+            if length < 0:
+                return self._error(400, None, protocol.ERR_PARSE, "invalid content length")
             if length > _MAX_BODY:
                 return self._error(413, None, protocol.ERR_PARSE, "payload too large")
             req = json.loads((self.rfile.read(length) if length else b"{}").decode("utf-8"))
@@ -830,16 +851,12 @@ class A2AAdapter(BasePlatformAdapter):
         callback_url = self.tasks.pop_push_url(task_id)
         if not callback_url:
             return
-        if not security.is_safe_callback_url(callback_url, localhost_mode=self._security_context.localhost_only()):
-            return fail("blocked — unsafe callback URL: %s", callback_url)
         payload = protocol.status_update(task_id, context_id, state, (reply or "")[:2000])
         headers = {"Content-Type": "application/json"}
         if signature := self._security_context.sign_push_payload(payload):
             headers["X-A2A-Signature"] = signature
         try:
-            req = urllib.request.Request(callback_url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                status = resp.status
+            status = security.post_callback(callback_url, payload, headers, localhost_mode=self._security_context.localhost_only())
         except Exception as e:
             return fail("failed: %s", e)
         if not 200 <= status < 300:

@@ -12,8 +12,8 @@ import json
 import logging
 import os
 import re
+import socket
 import time
-import urllib.parse
 from dataclasses import dataclass
 from typing import Optional
 from agent.proxy_bypass import is_loopback_host
@@ -97,11 +97,11 @@ class A2ASecurityContext:
         parts = (auth_header or "").split(None, 1)
         if len(parts) != 2 or parts[0].lower() != "bearer":
             return None
-        presented = parts[1].strip()
+        presented = parts[1].strip().encode()
         for token, name in self.peer_tokens:
-            if hmac.compare_digest(presented, token):
+            if hmac.compare_digest(presented, token.encode()):
                 return name
-        if self.bearer_token and hmac.compare_digest(presented, self.bearer_token):
+        if self.bearer_token and hmac.compare_digest(presented, self.bearer_token.encode()):
             return f"ip:{client_ip or 'unknown'}"
         return None
 
@@ -180,36 +180,57 @@ def redact_outbound(text: str) -> str:
     return _EMAIL_RE.sub("[redacted-email]", redact_for_egress(text))
 
 
-# Blocked even in localhost-only mode — a remote peer must not make us probe internal services
-# (link-local/AWS metadata, RFC1918, unspecified, IPv6 link-local/ULA). Loopback only in localhost mode.
-_BLOCKED_PREFIXES = ("169.254.", "127.", "10.", *(f"172.{i}." for i in range(16, 32)), "192.168.",
-                     "0.0.0.0", "::1", "fe80:", "fc00:", "fd00:")
+def _callback_destination(url: str, localhost_mode: bool):
+    """Resolve once and return only validated addresses that delivery can dial directly."""
+    import httpx
+
+    parsed = httpx.URL(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.host or parsed.userinfo:
+        raise ValueError("Invalid A2A callback URL")
+    local = localhost_mode and is_loopback_host(parsed.host)
+    addresses = []
+    for entry in socket.getaddrinfo(parsed.host, parsed.port, type=socket.SOCK_STREAM):
+        address = ipaddress.ip_address(entry[4][0])
+        ip = getattr(address, "ipv4_mapped", None) or address
+        if local:
+            allowed = ip.is_loopback
+        else:
+            allowed = ip.is_global and not (ip.is_multicast or ip.is_reserved or getattr(ip, "is_site_local", False))
+        if not allowed:
+            raise ValueError("Blocked internal A2A callback destination")
+        if str(address) not in addresses:
+            addresses.append(str(address))
+    if not addresses:
+        raise ValueError("No addresses for A2A callback")
+    return parsed, addresses
 
 
 def is_safe_callback_url(url: str, *, localhost_mode: Optional[bool] = None) -> bool:
-    """True when a push callback URL is http(s) and not internal/private/loopback."""
-    if localhost_mode is None:
-        localhost_mode = localhost_only()
+    """Whether this URL's current DNS answers are permitted for push delivery."""
+    import httpx
+
     try:
-        parsed = urllib.parse.urlparse(url) if url and isinstance(url, str) else None
-    except Exception:
+        _callback_destination(url, localhost_only() if localhost_mode is None else localhost_mode)
+    except (ValueError, TypeError, OSError, httpx.InvalidURL):
         return False
-    hostname = (parsed.hostname or "") if parsed and parsed.scheme in ("http", "https") else ""
-    if not hostname:
-        return False
-    hostname_lower = hostname.lower()
-    if hostname_lower == "localhost":
-        return localhost_mode
-    for prefix in _BLOCKED_PREFIXES:
-        if hostname_lower.startswith(prefix.lower()):
-            return bool(localhost_mode and prefix in ("127.", "::1"))
-    try:
-        ip = ipaddress.ip_address(hostname)
-        if ip.is_loopback or ip.is_link_local or ip.is_private or ip.is_reserved:
-            return bool(localhost_mode and ip.is_loopback)
-    except ValueError:
-        pass  # a hostname, not an IP
     return True
+
+
+def post_callback(url: str, payload: dict, headers: dict, *, localhost_mode: bool) -> int:
+    """Keep the original HTTP Host and TLS identity while dialing a vetted IP."""
+    import httpx
+
+    destination, addresses = _callback_destination(url, localhost_mode)
+    headers = {**headers, "Host": destination.netloc.decode("ascii")}
+    with httpx.Client(timeout=10, trust_env=False, follow_redirects=False) as client:
+        for index, address in enumerate(addresses):
+            try:
+                with client.stream("POST", destination.copy_with(host=address), json=payload, headers=headers,
+                                   extensions={"sni_hostname": destination.raw_host.decode("ascii")}) as response:
+                    return response.status_code
+            except (httpx.ConnectError, httpx.ConnectTimeout):
+                if index + 1 == len(addresses):
+                    raise
 
 
 def audit(direction: str, peer: str, task_id: str, summary: str) -> None:

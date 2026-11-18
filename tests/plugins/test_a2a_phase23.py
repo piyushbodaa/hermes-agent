@@ -730,7 +730,8 @@ class TestA2AOrchestrate:
 
 
 class TestSSRFProtection:
-    def test_safe_public_urls_allowed(self):
+    def test_safe_public_urls_allowed(self, monkeypatch):
+        monkeypatch.setattr(socket, "getaddrinfo", lambda *args, **kw: [(None, None, None, "", ("93.184.216.34", 443))])
         assert security.is_safe_callback_url("https://example.com/webhook") is True
         assert security.is_safe_callback_url("http://example.com/webhook") is True
 

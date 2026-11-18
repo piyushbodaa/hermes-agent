@@ -8,6 +8,7 @@ import contextlib
 import json
 import logging
 import urllib.error
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Optional
@@ -49,9 +50,26 @@ def _auth_header(auth: dict) -> dict:
     return {"Authorization": f"Bearer {auth['token']}"} if auth and auth.get("type") == "bearer" and auth.get("token") else {}
 
 
+def _http_origin(url: str) -> tuple[str, str, int]:
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username is not None:
+        raise ValueError("A2A peers require an HTTP(S) origin without embedded credentials")
+    port = parsed.port
+    return parsed.scheme, parsed.hostname, port if port is not None else (443 if parsed.scheme == "https" else 80)
+
+
+class _PeerRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        destination = _http_origin(newurl)
+        if req.has_header("Authorization") and destination != _http_origin(req.full_url):
+            raise ValueError("Authenticated A2A peer redirected to another origin")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def _http_json(url: str, headers: dict, timeout: int, method: str, data: Optional[bytes] = None) -> dict:
+    _http_origin(url)
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with urllib.request.build_opener(_PeerRedirectHandler()).open(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
@@ -102,6 +120,9 @@ def _send_task(agent_label: str, peer: dict, message: str, context_id: str) -> t
         card = _fetch_card(base_url, headers, min(timeout, 30))  # best-effort, to learn the rpc URL
     except Exception:
         card = None
+    rpc_url = _rpc_url(base_url, card)
+    if headers and _http_origin(rpc_url) != _http_origin(base_url):
+        raise ValueError("Authenticated A2A peer advertised a different RPC origin")
     ctx = context_id or protocol.new_context_id()
     safe_message = security.redact_outbound(message)
     # v1.0: contextId lives inside the Message, not at the params top level.
@@ -114,7 +135,7 @@ def _send_task(agent_label: str, peer: dict, message: str, context_id: str) -> t
     security.audit("outbound", agent_label, rpc_body["id"], safe_message)
     protocol.persist_message(ctx, "user", safe_message, rpc_body["id"])
     protocol.metrics.outbound_total += 1
-    resp = _http_post_json(_rpc_url(base_url, card), rpc_body, headers, timeout)
+    resp = _http_post_json(rpc_url, rpc_body, headers, timeout)
     if "error" in resp:
         raise ValueError(f"Peer '{agent_label}' returned an error: {resp['error'].get('message', resp['error'])}")
     payload = protocol.unwrap_send_message_response(resp.get("result", {}))
