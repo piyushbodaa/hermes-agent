@@ -16,6 +16,7 @@ import pytest
 from tools.environments.file_sync import (
     FileSyncManager,
     _cleanup_stale_sync_back_temp,
+    _extract_sync_back_archive,
     _sha256_file,
     _SYNC_BACK_MAX_RETRIES,
     _SYNC_BACK_STALE_SECONDS,
@@ -406,6 +407,23 @@ class TestSyncBackSizeCap:
         # Warning should mention the cap
         assert any("cap" in r.message for r in caplog.records)
 
+
+    @pytest.mark.parametrize(("limit", "accepted"), [(5, False), (6, True)])
+    def test_logical_cap_counts_every_synced_name(self, tmp_path, limit, accepted):
+        archive = tmp_path / "files.tar"
+        with tarfile.open(archive, "w") as tar:
+            entry = tarfile.TarInfo("one")
+            entry.size = 3
+            tar.addfile(entry, io.BytesIO(b"abc"))
+            alias = tarfile.TarInfo("two")
+            alias.type = tarfile.LNKTYPE
+            alias.linkname = "one"
+            tar.addfile(alias)
+        staging = tmp_path / "stage"
+        staging.mkdir()
+        assert _extract_sync_back_archive(str(archive), str(staging), limit) is accepted
+        if accepted:
+            assert (staging / "two").read_bytes() == b"abc"
 
     def test_cap_override_config_key_raises_the_cap(self, tmp_path, monkeypatch, caplog):
         """config.yaml ``terminal.sync_back_max_bytes`` overrides the 2 GiB default; a

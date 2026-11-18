@@ -81,6 +81,45 @@ def _sync_back_max_bytes() -> int:
     return _SYNC_BACK_MAX_BYTES
 
 
+def _extract_sync_back_archive(archive: str, staging: str, max_bytes: int) -> bool:
+    """Stage ordinary files within the configured logical byte budget."""
+    remaining = max_bytes
+
+    def bounded_member(member: tarfile.TarInfo, directory: str) -> tarfile.TarInfo | None:
+        nonlocal remaining
+        if not (member.isfile() or member.isdir() or member.islnk()):
+            return None
+        member = tarfile.data_filter(member, directory)
+        if member.isdir():
+            return member
+        destination = Path(directory) / member.name
+        if member.islnk():
+            source = Path(directory) / member.linkname
+            if not source.is_file():
+                raise tarfile.FilterError("sync-back hard link has no staged file")
+            size = source.stat().st_size
+        else:
+            size = member.size
+        if size < 0 or size > remaining:
+            raise tarfile.FilterError(f"sync-back file data exceeds the {max_bytes}-byte cap")
+        remaining -= size
+        if destination.is_file():
+            # A later entry can replace a name but must not enlarge previously
+            # budgeted files through a hard-link alias.
+            destination.unlink()
+        return member
+
+    try:
+        # All four sync backends generate plain tar. Avoid implicit decompression
+        # of archive headers before a member can be charged to the budget.
+        with tarfile.open(archive, mode="r:") as tar:
+            tar.extractall(staging, filter=bounded_member)
+    except (tarfile.ReadError, tarfile.FilterError) as exc:
+        logger.warning("sync_back: rejecting remote archive: %s", exc)
+        return False
+    return True
+
+
 def _sync_back_temp_prefix() -> str:
     """Temp prefix embedding the owning PID so the stale sweep can tell a hard-killed
     process's leftovers from another live gateway's in-flight transfer without guessing
@@ -436,8 +475,8 @@ class FileSyncManager:
                 return
 
             with tempfile.TemporaryDirectory(prefix=_sync_back_temp_prefix()) as staging:
-                with tarfile.open(tar_path) as tar:
-                    tar.extractall(staging, filter="data")
+                if not _extract_sync_back_archive(tar_path, staging, max_bytes):
+                    return
 
                 upload_only = self._upload_only_host_paths | _credential_host_paths()
                 applied = 0
