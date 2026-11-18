@@ -6,6 +6,7 @@
 //     HERMES_HOME="$D/home" HERMES_DESKTOP_USER_DATA_DIR="$D/userdata" hermes desktop
 import { spawn } from 'node:child_process'
 import fs from 'node:fs'
+import { createRequire } from 'node:module'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -55,7 +56,7 @@ try {
     if (Date.now() > deadline) throw new Error('Renderer did not become ready')
     await new Promise(resolve => setTimeout(resolve, 250))
   }
-  const binary = path.join(desktop, 'node_modules/electron/dist', process.platform === 'darwin' ? 'Electron.app/Contents/MacOS/Electron' : process.platform === 'win32' ? 'electron.exe' : 'electron')
+  const binary = createRequire(import.meta.url)('electron')
   electron = spawn(binary, [entry], { cwd: desktop, env, stdio: 'inherit' })
   console.log(`Connector rehearsal: ${sandbox}\nRenderer: ${url}\nReal service; OAuth requires your approval. Reuse the sandbox path to reopen this identity.`)
   electron.on('exit', stop)

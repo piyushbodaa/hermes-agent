@@ -23,8 +23,9 @@ const { AppInfo } = await import(pathToFileURL(path.join(builder, 'appInfo.js'))
 const { MacPackager } = await import(pathToFileURL(path.join(builder, 'macPackager.js')))
 const { createMacApp } = await import(pathToFileURL(path.join(builder, 'electron/mac/electronMac.js')))
 const { build } = require('esbuild')
-const electron = path.dirname(require.resolve('electron'))
-const electronApp = path.join(electron, 'dist/Electron.app')
+// Requiring Electron also prepares its binary on a fresh install. The macOS
+// executable is inside the app bundle at Contents/MacOS/Electron.
+const electronApp = path.resolve(path.dirname(require('electron')), '..', '..')
 assert.ok(process.argv[2], 'Pass the icon input root with cases.json and generated ICNS files')
 const inputs = path.resolve(process.argv[2])
 const cases = JSON.parse(fs.readFileSync(path.join(inputs, 'cases.json'), 'utf8'))
@@ -289,7 +290,7 @@ try {
         platform: os.release(),
         arch: process.arch,
         node: process.version,
-        electron: JSON.parse(fs.readFileSync(path.join(electron, 'package.json'), 'utf8')).version,
+        electron: require('electron/package.json').version,
         builder: JSON.parse(fs.readFileSync(path.join(builder, '../package.json'), 'utf8')).version,
         testSha256: hash(fileURLToPath(import.meta.url)),
         sourceHashes: Object.fromEntries(
