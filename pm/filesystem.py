@@ -5,6 +5,7 @@ may import a dependency or another PM module.
 """
 from __future__ import annotations
 
+from functools import lru_cache
 import errno
 import hashlib
 import ntpath
@@ -32,6 +33,34 @@ def is_junction(path: Path) -> bool:
         return path.lstat().st_reparse_tag == stat.IO_REPARSE_TAG_MOUNT_POINT
     except (OSError, AttributeError):
         return False
+
+
+@lru_cache(maxsize=None)
+def _fresh_temp_directory(preferred: Path) -> tempfile.TemporaryDirectory:
+    # Keep fallback directories private and stable within this process and remove
+    # them on normal shutdown. They are only used when a stable slot is unavailable.
+    return tempfile.TemporaryDirectory(prefix="h-", dir=preferred.parent, ignore_cleanup_errors=True)
+
+
+def private_temp_directory(preferred: Path) -> Path:
+    """Reuse an owner-only temp directory, or allocate a private sibling if its name was taken."""
+    uid = getattr(os, "geteuid", lambda: None)()
+    if uid is not None:
+        parent = preferred.parent.stat()
+        if parent.st_uid not in (0, uid) or (parent.st_mode & 0o022 and not parent.st_mode & stat.S_ISVTX):
+            raise PermissionError(f"Unsafe temporary directory parent: {preferred.parent}")
+    # Windows does not expose owner/ACL checks through stat. mkdtemp creates a fresh
+    # private directory and the process can safely reuse it on subsequent calls.
+    if uid is None:
+        return Path(_fresh_temp_directory(preferred).name)
+    try:
+        preferred.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    info = preferred.lstat()
+    if stat.S_ISDIR(info.st_mode) and info.st_uid == uid and not info.st_mode & 0o077:
+        return preferred
+    return Path(_fresh_temp_directory(preferred).name)
 
 
 _VERBATIM = "\\\\?\\"

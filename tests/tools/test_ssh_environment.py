@@ -163,10 +163,8 @@ class TestControlSocketPath:
         fake_tmp = "/var/folders/2t/wbkw5yb158jc3zhswgl7tz9c0000gn/T"
         monkeypatch.setattr("tools.environments.ssh.tempfile.gettempdir",
                             lambda: fake_tmp)
-        # The simulated path doesn't exist on the test host — skip the
-        # real mkdir so __init__ can proceed.
-        from pathlib import Path as _Path
-        monkeypatch.setattr(_Path, "mkdir", lambda *a, **k: None)
+        # Exercise the path-length calculation without creating the simulated macOS root.
+        monkeypatch.setattr("tools.environments.ssh.private_temp_directory", lambda path: path)
 
         env = SSHEnvironment(
             host="9373:9b91:4480:558d:708e:e601:24e8:d8d0",
@@ -180,6 +178,20 @@ class TestControlSocketPath:
             f"Unix domain socket limit once SSH appends its 16-byte suffix: "
             f"{env.control_socket} (+{self._SSH_CONTROLMASTER_SUFFIX} = {total_len})"
         )
+
+    @pytest.mark.platforms("linux", "macos")
+    def test_control_socket_avoids_linked_directory(self, monkeypatch, tmp_path):
+        import os
+
+        target = tmp_path / "other"
+        target.mkdir()
+        preferred = tmp_path / f"hssh-{os.geteuid()}"
+        preferred.symlink_to(target, target_is_directory=True)
+        monkeypatch.setattr("tools.environments.ssh.tempfile.gettempdir", lambda: str(tmp_path))
+        env = SSHEnvironment(host="h", user="u", port=22)
+        assert env.control_dir != preferred
+        assert env.control_dir.stat().st_mode & 0o077 == 0
+        assert not list(target.iterdir())
 
     def test_path_is_deterministic_across_instances(self):
         """Same (user, host, port) must yield the same control socket so

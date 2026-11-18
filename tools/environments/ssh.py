@@ -12,6 +12,7 @@ import tempfile
 from pathlib import Path
 from typing import Iterable
 
+from pm.filesystem import private_temp_directory
 from tools.environments.base import BaseEnvironment, EnvironmentConnectionError
 from tools.environments.base_output import _popen_bash
 from tools.environments.file_sync import (
@@ -62,8 +63,10 @@ class SSHEnvironment(BaseEnvironment):
                  probe_only: bool = False, sync_files: bool = True, persistent: bool = True):
         super().__init__(cwd=cwd, timeout=timeout, persist_env=persistent)
         self.host, self.user, self.port, self.key_path = host, user, port, key_path
-        self.control_dir = Path(tempfile.gettempdir()) / "hermes-ssh"
-        self.control_dir.mkdir(parents=True, exist_ok=True)
+        uid = getattr(os, "geteuid", lambda: 0)()
+        self.control_dir = Path(tempfile.gettempdir()) / f"hssh-{uid}"
+        if _SSH_MULTIPLEX:
+            self.control_dir = private_temp_directory(self.control_dir)
         # Short, deterministic socket name: the path must stay under macOS's 104-byte sun_path
         # limit (raw user@host:port + SSH's 16-byte suffix under a deep $TMPDIR exceeds it), and
         # stability across reconnects keeps ControlMaster reuse working. A probe gets its own

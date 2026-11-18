@@ -11,6 +11,7 @@ import os
 import platform
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 from collections import deque
@@ -19,6 +20,7 @@ from pathlib import Path
 import tempfile
 import threading
 import time
+import uuid
 import wave
 from typing import Any, Callable, Dict, List, Optional
 
@@ -26,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 from hermes_constants import is_termux as _is_termux_environment
 from hermes_platform.host.runtime import is_wsl
+from pm.filesystem import private_temp_directory
 from tools.voice_mode_transcript import _voice_config, is_voice_stop_phrase, is_whisper_hallucination
 
 # ── Recording parameters ──
@@ -35,7 +38,7 @@ DTYPE = "int16"
 SAMPLE_WIDTH = 2  # bytes per sample (int16)
 SILENCE_RMS_THRESHOLD = 200  # RMS below this = silence (int16 range 0-32767)
 SILENCE_DURATION_SECONDS = 3.0  # continuous silence before auto-stop
-_TEMP_DIR = os.path.join(tempfile.gettempdir(), "hermes_voice")
+_TEMP_DIR = os.path.join(tempfile.gettempdir(), f"hermes-voice-{getattr(os, 'geteuid', lambda: 0)()}")
 
 
 # ── Lazy audio imports ──
@@ -517,10 +520,10 @@ def stop_thinking_sound() -> None:
 
 
 # ── Recorders ──
-def _new_recording_path(ext: str) -> str:
-    """Timestamped ``recording_*.<ext>`` path under _TEMP_DIR (created on demand)."""
-    os.makedirs(_TEMP_DIR, exist_ok=True)
-    return os.path.join(_TEMP_DIR, f"recording_{time.strftime('%Y%m%d_%H%M%S')}.{ext}")
+def voice_output_path(prefix: str, ext: str) -> str:
+    """Generate an independent output name inside the recorder's private directory."""
+    directory = private_temp_directory(Path(_TEMP_DIR))
+    return str(directory / f"{prefix}_{uuid.uuid4().hex}.{ext}")
 
 
 # WAV path -> live STT session that heard the same take (``stt.streaming``). transcribe_recording
@@ -611,7 +614,7 @@ class TermuxAudioRecorder(_RecorderBase):
         with self._lock:
             if self._recording:
                 return
-            self._recording_path = _new_recording_path("aac")
+            self._recording_path = voice_output_path("recording", "aac")
         command = [mic_cmd, "-f", self._recording_path, "-l", "0", "-e", "aac",
                    "-r", str(SAMPLE_RATE), "-c", str(CHANNELS)]
         try:
@@ -926,7 +929,7 @@ class AudioRecorder(_RecorderBase):
     @staticmethod
     def _write_wav(audio_data, *, sample_rate: int = SAMPLE_RATE) -> str:
         """Write numpy int16 audio to a WAV file; returns the path."""
-        wav_path = _new_recording_path("wav")
+        wav_path = voice_output_path("recording", "wav")
         _write_wav_frames(wav_path, audio_data.tobytes(), sample_rate)
         logger.info("WAV written: %s (%d bytes)", wav_path, os.path.getsize(wav_path))
         return wav_path
@@ -1541,15 +1544,31 @@ def check_voice_requirements() -> dict[str, Any]:
 # ── Temp file cleanup ──
 def cleanup_temp_recordings(max_age_seconds: int = 3600) -> int:
     """Remove ``recording_*.wav`` temp files older than *max_age_seconds*; returns the count."""
-    if not os.path.isdir(_TEMP_DIR):
+    try:
+        directory = private_temp_directory(Path(_TEMP_DIR))
+    except OSError:
         return 0
+    directories = {directory}
+    # Older versions stored recordings under a shared name. Repair our own legacy
+    # directory if it was never writable by other users; leave other owners alone.
+    uid = getattr(os, "geteuid", lambda: None)()
+    legacy = Path(_TEMP_DIR).parent / "hermes_voice"
+    with suppress(OSError):
+        info = legacy.lstat()
+        if uid is not None and stat.S_ISDIR(info.st_mode) and info.st_uid == uid and not info.st_mode & 0o022:
+            legacy.chmod(0o700)
+            directories.add(legacy)
+
     deleted, now = 0, time.time()
-    for entry in os.scandir(_TEMP_DIR):
-        if entry.is_file() and entry.name.startswith("recording_") and entry.name.endswith(".wav"):
-            with suppress(OSError):
-                if now - entry.stat().st_mtime > max_age_seconds:
-                    os.unlink(entry.path)
-                    deleted += 1
+    for directory in directories:
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if entry.name.startswith("recording_") and entry.name.endswith(".wav"):
+                    with suppress(OSError):
+                        info = entry.stat(follow_symlinks=False)
+                        if stat.S_ISREG(info.st_mode) and now - info.st_mtime > max_age_seconds:
+                            os.unlink(entry.path)
+                            deleted += 1
     if deleted:
         logger.debug("Cleaned up %d old voice recordings", deleted)
     return deleted

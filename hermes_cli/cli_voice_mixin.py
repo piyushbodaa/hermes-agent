@@ -10,7 +10,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import tempfile
 import threading
 import time
 
@@ -300,7 +299,7 @@ class CLIVoiceMixin:
         self._voice_tts_done.clear()
         try:
             from tools.tts_tool import text_to_speech_tool
-            from tools.voice_mode import play_audio_file
+            from tools.voice_mode import play_audio_file, voice_output_path
             # Shared cleaner strips markdown/emoji/⋗ blocks/verifier footer; the TTS tool owns
             # provider request limits and long-form chunking.
             try:
@@ -324,9 +323,7 @@ class CLIVoiceMixin:
             self._voice_last_tts_text = tts_text
             # MP3 for CLI playback (afplay doesn't handle OGG well); the TTS tool may
             # auto-convert MP3->OGG but the original MP3 remains.
-            out_dir = os.path.join(tempfile.gettempdir(), "hermes_voice")
-            os.makedirs(out_dir, exist_ok=True)
-            mp3_path = os.path.join(out_dir, f"tts_{time.strftime('%Y%m%d_%H%M%S')}.mp3")
+            mp3_path = voice_output_path("tts", "mp3")
 
             raw_result = text_to_speech_tool(text=tts_text, output_path=mp3_path)
             try:

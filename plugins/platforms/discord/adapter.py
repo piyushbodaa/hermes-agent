@@ -3746,11 +3746,8 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             import random
             phrases = self._voice_fx_cfg.get("ack_phrases") or _default_voice_ack_phrases()
             phrase = random.choice(phrases)
-        import uuid as _uuid
-        audio_path = os.path.join(
-            tempfile.gettempdir(), "hermes_voice", f"ack_{_uuid.uuid4().hex[:12]}.mp3",
-        )
-        os.makedirs(os.path.dirname(audio_path), exist_ok=True)
+        from tools.voice_mode import voice_output_path
+        audio_path = voice_output_path("ack", "mp3")
         try:
             from tools.tts_tool import text_to_speech_tool
             result_json = await asyncio.to_thread(

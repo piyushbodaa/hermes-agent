@@ -34,9 +34,10 @@ def sample_wav(tmp_path):
 def temp_voice_dir(tmp_path, monkeypatch):
     """Redirect _TEMP_DIR to a temporary path."""
     voice_dir = tmp_path / "hermes_voice"
-    voice_dir.mkdir()
+    voice_dir.mkdir(mode=0o700)
     monkeypatch.setattr("tools.voice_mode._TEMP_DIR", str(voice_dir))
-    return voice_dir
+    from pm.filesystem import private_temp_directory
+    return private_temp_directory(voice_dir)
 
 
 @pytest.fixture
@@ -642,6 +643,68 @@ class TestMacOSAudioOutputPolicy:
 # ============================================================================
 # cleanup_temp_recordings
 # ============================================================================
+
+def test_recording_names_are_private_and_distinct(temp_voice_dir):
+    from tools.voice_mode import voice_output_path
+
+    first = Path(voice_output_path("recording", "wav"))
+    second = Path(voice_output_path("recording", "wav"))
+    assert first.parent == second.parent == temp_voice_dir
+    assert first != second
+    if hasattr(os, "geteuid"):
+        assert first.parent.stat().st_mode & 0o077 == 0
+
+
+@pytest.mark.platforms("linux", "macos")
+def test_voice_avoids_nonprivate_directory(tmp_path, monkeypatch):
+    from tools.voice_mode import voice_output_path
+
+    shared = tmp_path / "permissive"
+    shared.mkdir(mode=0o700)
+    shared.chmod(0o755)
+    monkeypatch.setattr("tools.voice_mode._TEMP_DIR", str(shared))
+    destination = Path(voice_output_path("tts", "mp3"))
+    assert destination.parent != shared
+    assert destination.parent.stat().st_mode & 0o077 == 0
+    assert not list(shared.iterdir())
+
+
+@pytest.mark.platforms("linux", "macos")
+def test_voice_checks_existing_directory_owner(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from tools.voice_mode import voice_output_path
+
+    existing = tmp_path / "existing"
+    existing.mkdir(mode=0o700)
+    monkeypatch.setattr("tools.voice_mode._TEMP_DIR", str(existing))
+    original = Path.lstat
+
+    def metadata(path):
+        info = original(path)
+        if path == existing:
+            return SimpleNamespace(st_mode=info.st_mode, st_uid=info.st_uid + 1)
+        return info
+
+    monkeypatch.setattr(Path, "lstat", metadata)
+    destination = Path(voice_output_path("tts", "mp3"))
+    assert destination.parent != existing
+    assert not list(existing.iterdir())
+
+
+@pytest.mark.platforms("linux", "macos")
+def test_cleanup_restricts_owned_legacy_directory(tmp_path, monkeypatch):
+    from tools.voice_mode import cleanup_temp_recordings
+
+    monkeypatch.setattr("tools.voice_mode._TEMP_DIR", str(tmp_path / "new"))
+    old = tmp_path / "hermes_voice"
+    old.mkdir(mode=0o755)
+    recording = old / "recording_old.wav"
+    recording.write_bytes(b"sample")
+    os.utime(recording, (1, 1))
+    assert cleanup_temp_recordings() == 1
+    assert old.stat().st_mode & 0o077 == 0
+    assert not recording.exists()
+
 
 class TestCleanupTempRecordings:
     def test_old_files_deleted(self, temp_voice_dir):
