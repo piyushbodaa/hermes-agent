@@ -12,6 +12,7 @@ import posixpath
 import shlex
 import shutil
 import signal
+import stat
 import tarfile
 import tempfile
 import threading
@@ -21,12 +22,13 @@ try:
     import fcntl
 except ImportError:
     fcntl = None  # Windows — file locking skipped
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Callable
 
 import psutil
 
 from hermes_constants import get_hermes_home
+from pm.filesystem import is_junction
 from tools.environments.base import _file_mtime_key
 from utils import mtime_is_racy
 
@@ -162,6 +164,16 @@ def _credential_host_paths() -> set[str]:
     return {
         _resolve_host_path_str(entry["host_path"])
         for entry in mounts if isinstance(entry, dict) and entry.get("host_path")}
+
+
+def _excluded_skill_destination(remote_path: str) -> bool:
+    from agent.skill_utils import EXCLUDED_SKILL_DIRS
+
+    parts = PurePosixPath(remote_path).parts
+    for index, name in enumerate(parts[:-1]):
+        if name == ".hermes" and parts[index + 1] in {"skills", "external_skills", "project_skills"}:
+            return any(part.casefold() in EXCLUDED_SKILL_DIRS for part in parts[index + 2:])
+    return False
 
 
 def quoted_rm_command(remote_paths: list[str]) -> str:
@@ -452,6 +464,8 @@ class FileSyncManager:
         """Copy one extracted remote file onto the host if it changed since push. Returns 1 if
         applied, 0 if skipped (unchanged, unmapped, or an upload-only credential). A host file
         modified since push is overwritten with the remote version (last-write-wins) with a warning."""
+        if not stat.S_ISREG(os.lstat(staged_file).st_mode) or _excluded_skill_destination(remote_path):
+            return 0
         pushed_hash = self._pushed_hashes.get(remote_path)
         if pushed_hash is not None and _sha256_file(staged_file) == pushed_hash:
             return 0  # unchanged from push
@@ -463,6 +477,11 @@ class FileSyncManager:
                 logger.debug("sync_back: skipping %s (no host mapping)", remote_path)
                 return 0
 
+        destination = Path(host_path)
+        if destination.is_symlink() or is_junction(destination):
+            return 0
+        if destination.exists() and not destination.is_file():
+            return 0
         if self._is_upload_only_host_path(host_path, upload_only_host_paths):
             logger.debug("sync_back: skipping upload-only credential file %s", remote_path)
             return 0
@@ -473,8 +492,16 @@ class FileSyncManager:
                 "since push, remote also changed. Applying remote version (last-write-wins).",
                 remote_path)
 
-        os.makedirs(os.path.dirname(host_path), exist_ok=True)
-        shutil.copy2(staged_file, host_path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        # Replace only this directory entry. In-place copying would modify every hard link
+        # to the old inode, including aliases outside the operator's synced directories.
+        fd, temporary = tempfile.mkstemp(dir=destination.parent)
+        os.close(fd)
+        try:
+            shutil.copy2(staged_file, temporary)
+            os.replace(temporary, destination)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
         return 1
 
     def _resolve_host_path(self, remote_path: str, file_mapping: list[tuple[str, str]] | None = None) -> str | None:
@@ -492,7 +519,15 @@ class FileSyncManager:
                 continue
             remote_dir = posixpath.dirname(remote)  # remote paths are POSIX even on a Windows host
             if remote_path.startswith(remote_dir + "/"):
-                return str(Path(host).parent / remote_path[len(remote_dir) + 1:])
+                # The upload walk omitted links. A new remote name must not bring one of
+                # those omitted files or directories back into the host write set.
+                root = Path(host).parent
+                candidate = root
+                for part in PurePosixPath(remote_path[len(remote_dir) + 1:]).parts:
+                    candidate = candidate / part
+                    if part == ".." or candidate.is_symlink() or is_junction(candidate):
+                        return None
+                return str(candidate)
         return None
 
     @staticmethod

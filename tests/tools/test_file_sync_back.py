@@ -203,6 +203,31 @@ class TestSyncBackAppliesChanged:
 class TestSyncBackNewRemoteFile:
     """File created on remote (not in _pushed_hashes) is applied via _infer_host_path."""
 
+    def test_inferred_destinations_respect_local_links_and_excluded_directories(self, tmp_path):
+        root = tmp_path / "skills"
+        ordinary = Path(_write_file(root / "one.md", b"before"))
+        outside = Path(_write_file(tmp_path / "outside" / "one.md", b"original"))
+        (root / "local-link").symlink_to(outside)
+        (root / "folder-link").symlink_to(outside.parent, target_is_directory=True)
+        mapping = [(str(ordinary), "/root/.hermes/skills/one.md")]
+        files = {f"root/.hermes/skills/{name}": b"new" for name in
+                 ("local-link", "folder-link/one.md", ".git/config", "two.md")}
+        mgr = _make_manager(tmp_path, mapping, _make_download_fn(files))
+        mgr.sync_back(hermes_home=tmp_path / ".hermes")
+        assert outside.read_bytes() == b"original"
+        assert not (root / ".git").exists()
+        assert (root / "two.md").read_bytes() == b"new"
+
+    def test_update_only_replaces_its_own_hard_link(self, tmp_path):
+        host = Path(_write_file(tmp_path / "skills" / "one.md", b"before"))
+        other = tmp_path / "other.md"
+        os.link(host, other)
+        mapping = [(str(host), "/root/.hermes/skills/one.md")]
+        download = _make_download_fn({"root/.hermes/skills/one.md": b"after"})
+        _make_manager(tmp_path, mapping, download).sync_back(hermes_home=tmp_path / ".hermes")
+        assert host.read_bytes() == b"after"
+        assert other.read_bytes() == b"before"
+
     def test_sync_back_detects_new_remote_file(self, tmp_path):
         # Existing mapping gives _infer_host_path a prefix to work with
         existing_host = tmp_path / "host" / "skills" / "existing.py"
