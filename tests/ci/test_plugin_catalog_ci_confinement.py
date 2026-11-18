@@ -7,6 +7,7 @@ git ``url.insteadOf`` rewrite. One case per closed bypass, plus the legitimate
 flows that must keep passing.
 """
 
+import json
 import os
 import subprocess
 import sys
@@ -22,7 +23,7 @@ ROOT = Path(__file__).resolve().parents[2]
 # `git show origin/main:...`) to prove a case fails on the old gate.
 WORKFLOW = Path(os.environ.get(
     "CATALOG_CI_WORKFLOW", ROOT / ".github/workflows/plugin-catalog-ci.yml"))
-REPO_URL = "https://fixture.invalid/repo"
+REPO_URL = "https://github.com/catalog-fixture/benign-plugin"
 
 
 def _step(name_prefix: str) -> str:
@@ -86,11 +87,15 @@ def _planted(tmp_path: Path) -> Path:
 
 
 def _gate(tmp_path: Path, origin: Path, entries: list[Path],
-          hermes_stub: str = "#!/bin/sh\nexit 0\n") -> subprocess.CompletedProcess:
+          gh_stub: str = "#!/bin/sh\nexit 1\n") -> subprocess.CompletedProcess:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
     stub = bin_dir / "hermes"
-    stub.write_text(hermes_stub, encoding="utf-8")
+    # The inspection job must complete without loading candidate code.
+    stub.write_text("#!/bin/sh\nexit 97\n", encoding="utf-8")
+    stub.chmod(0o755)
+    stub = bin_dir / "gh"
+    stub.write_text(gh_stub, encoding="utf-8")
     stub.chmod(0o755)
     env = {
         **os.environ,
@@ -102,7 +107,9 @@ def _gate(tmp_path: Path, origin: Path, entries: list[Path],
         # CI runs the step from the hermes-agent checkout; `-I` must ignore this.
         "PYTHONPATH": str(ROOT),
         "GIT_TERMINAL_PROMPT": "0",
+        "GIT_ALLOW_PROTOCOL": "file",
         "GITHUB_WORKSPACE": str(ROOT),
+        "GITHUB_OUTPUT": str(tmp_path / "step-outputs"),
         "GIT_CONFIG_COUNT": "1",
         "GIT_CONFIG_KEY_0": f"url.{origin.as_uri()}.insteadOf",
         "GIT_CONFIG_VALUE_0": REPO_URL,
@@ -205,9 +212,7 @@ def test_bypass_fails_the_gate(tmp_path, origin, case):
 
 
 def test_one_entry_cannot_skip_or_impersonate_the_others(tmp_path, origin):
-    """Plugin code that drains stdin must not consume the remaining entry list,
-    and an entry whose parser dies must fail itself rather than inherit the
-    previous entry's repo/sha."""
+    """An entry whose parser dies must fail itself, and later entries still get checked."""
     sha = _git(origin, "rev-parse", "HEAD")
     ok, crash, ok2 = (_entry(tmp_path, n, sha) for n in ("ok.yaml", "crash.yaml", "ok2.yaml"))
     python_stub = tmp_path / "bin" / "python3"
@@ -218,8 +223,7 @@ def test_one_entry_cannot_skip_or_impersonate_the_others(tmp_path, origin):
         f'#!/bin/sh\ncase "$*" in */crash.yaml) exit 1;; esac\nexec "{sys.executable}" "$@"\n',
         encoding="utf-8")
     python_stub.chmod(0o755)
-    res = _gate(tmp_path, origin, [ok, crash, ok2],
-                hermes_stub="#!/bin/sh\ncat >/dev/null\nexit 0\n")
+    res = _gate(tmp_path, origin, [ok, crash, ok2])
     assert res.returncode != 0, res.stdout + res.stderr
     assert "catalog entry parser failed" in res.stdout
     assert f"PASS: {ok}" in res.stdout
@@ -241,6 +245,60 @@ def test_legit_entry_passes_the_gate(tmp_path, origin, fields):
     res = _gate(tmp_path, origin, [entry])
     assert res.returncode == 0, res.stdout + res.stderr
     assert f"PASS: {entry}" in res.stdout
+
+
+@pytest.mark.parametrize("verified", [False, True])
+def test_attestation_checked_before_emitting_probe_matrix(tmp_path, origin, verified):
+    sample = origin / "plugin" / "sample.bin"
+    sample.write_bytes(b"MZ" + bytes(16))  # inert file with a native-binary header
+    sha = _commit(origin)
+    entry = _entry(tmp_path, "sample.yaml", sha, attested_binaries=["sample.bin"])
+    stub = ("#!/bin/sh\n"
+            'test "$1" = attestation && test "$2" = verify && test -f "$3" || exit 1\n'
+            'test "$4" = --repo && test "$5" = catalog-fixture/benign-plugin || exit 1\n'
+            f'test "$6" = --source-digest && test "$7" = "{sha}" || exit 1\n'
+            f'exit {0 if verified else 1}\n')
+    result = _gate(tmp_path, origin, [entry], gh_stub=stub)
+    assert (result.returncode == 0) == verified, result.stdout + result.stderr
+    output = tmp_path / "step-outputs"
+    if verified:
+        matrix = json.loads(output.read_text().removeprefix("candidates="))
+        assert matrix == [{"repo": REPO_URL, "sha": sha, "subdir": "plugin"}]
+    else:
+        assert "no build-provenance attestation" in result.stdout
+        assert not output.exists()
+
+
+def test_capability_probe_checks_out_admitted_revision(tmp_path, origin):
+    sha = _git(origin, "rev-parse", "HEAD")
+    (origin / "plugin" / "later.txt").write_text("next revision", encoding="utf-8")
+    _commit(origin)
+    hermes = tmp_path / "hermes"
+    hermes.write_text(
+        '#!/bin/sh\nset -eu\ntest "$1 $2 $3" = "plugins validate --install-deps"\n'
+        'test -f "$4/plugin.yaml"\ntest ! -f "$4/later.txt"\n'
+        'test "$(git -C "$4" rev-parse HEAD)" = "$PLUGIN_SHA"\n', encoding="utf-8")
+    hermes.chmod(0o755)
+    env = {**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}", "TMPDIR": str(tmp_path),
+           "PLUGIN_REPO": REPO_URL, "PLUGIN_SHA": sha, "PLUGIN_SUBDIR": "plugin",
+           "GIT_ALLOW_PROTOCOL": "file",
+           "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": f"url.{origin.as_uri()}.insteadOf",
+           "GIT_CONFIG_VALUE_0": REPO_URL}
+    result = _run(_step("Probe one inspected plugin"), tmp_path, tmp_path, env)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("inspection, entries, probes, allowed", [
+    ("success", "false", "skipped", True),
+    ("success", "true", "success", True),
+    ("success", "true", "skipped", False),
+    ("success", "true", "failure", False),
+    ("failure", "false", "skipped", False),
+])
+def test_required_check_needs_all_applicable_results(tmp_path, inspection, entries, probes, allowed):
+    env = {**os.environ, "INSPECTION": inspection, "HAS_ENTRIES": entries, "PROBES": probes}
+    result = _run(_step("Check catalog inspection and capability results"), tmp_path, tmp_path, env)
+    assert (result.returncode == 0) == allowed
 
 
 @pytest.mark.parametrize("mut", [
