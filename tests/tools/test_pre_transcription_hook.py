@@ -4,7 +4,7 @@
 Covers:
 
 1. Fixture plugin returning a prompt → the backend call receives
-   ``initial_prompt`` (faster-whisper) / ``prompt`` (OpenAI, Groq, Mistral).
+   ``initial_prompt`` (faster-whisper) / ``prompt`` (OpenAI, Groq).
    The API boundary is stubbed — no live model is loaded or called.
 2. Two hooks → last-writer-wins per field, in registration order.
 3. Hook returning the read-only ``file_path`` field → dropped with a log.
@@ -13,7 +13,7 @@ Covers:
    on the wire).
 5. ``stt.prompt`` config alone → threaded without any hook.
 6. Config + hook → hook wins (config is the base, hooks mutate on top).
-7. Unsupported backend (xAI, ElevenLabs) → DEBUG note and the call
+7. Unsupported backend (Mistral, xAI, ElevenLabs) → DEBUG note and the call
    proceeds without the prompt.
 8. Plugin-registered providers receive the prompt via the ABC's ``**extra``
    kwargs — no signature change.
@@ -154,30 +154,6 @@ class TestPromptThreading:
 
         assert result["success"] is True
         _, kwargs = mock_client.audio.transcriptions.create.call_args
-        assert kwargs["prompt"] == PROMPT
-
-    def test_prompt_reaches_mistral(self, monkeypatch, tmp_path):
-        """Unit-level: _transcribe_mistral forwards prompt to the SDK call."""
-        audio = _make_audio(tmp_path)
-        monkeypatch.setenv("MISTRAL_API_KEY", "mk-test")
-        # Never attempt a lazy install in tests.
-        monkeypatch.setattr("pm.ensure_import", lambda *a, **kw: None)
-
-        mistral_cls = MagicMock()
-        mock_client = mistral_cls.return_value.__enter__.return_value
-        mock_client.audio.transcriptions.complete.return_value = SimpleNamespace(
-            text="hello",
-        )
-        fake_mistralai = SimpleNamespace(client=SimpleNamespace(Mistral=mistral_cls))
-        monkeypatch.setitem(sys.modules, "mistralai", fake_mistralai)
-        monkeypatch.setitem(sys.modules, "mistralai.client", fake_mistralai.client)
-
-        result = transcription_tools._transcribe_mistral(
-            audio, "voxtral-mini-latest", prompt=PROMPT,
-        )
-
-        assert result["success"] is True
-        _, kwargs = mock_client.audio.transcriptions.complete.call_args
         assert kwargs["prompt"] == PROMPT
 
 
@@ -397,6 +373,34 @@ class TestSttPromptConfig:
 
 
 class TestUnsupportedBackends:
+    def test_mistral_retains_language_and_ignores_unsupported_prompt(
+        self, monkeypatch, tmp_path, caplog,
+    ):
+        audio = _make_audio(tmp_path)
+        monkeypatch.setenv("MISTRAL_API_KEY", "mk-test")
+        # Never attempt a lazy install in tests.
+        monkeypatch.setattr("pm.ensure_import", lambda *a, **kw: None)
+
+        mistral_cls = MagicMock()
+        mock_client = mistral_cls.return_value.__enter__.return_value
+        mock_client.audio.transcriptions.complete.return_value = SimpleNamespace(
+            text="hello",
+        )
+        fake_mistralai = SimpleNamespace(client=SimpleNamespace(Mistral=mistral_cls))
+        monkeypatch.setitem(sys.modules, "mistralai", fake_mistralai)
+        monkeypatch.setitem(sys.modules, "mistralai.client", fake_mistralai.client)
+
+        with caplog.at_level(logging.DEBUG, logger="tools.transcription_tools"):
+            result = transcription_tools._transcribe_mistral(
+                audio, "voxtral-mini-latest", language="en", prompt=PROMPT,
+            )
+
+        assert result["success"] is True
+        _, kwargs = mock_client.audio.transcriptions.complete.call_args
+        assert "prompt" not in kwargs
+        assert kwargs["language"] == "en"
+        assert "does not support transcription prompts" in caplog.text
+
     def test_xai_logs_debug_and_proceeds_without_prompt(
         self, monkeypatch, tmp_path, caplog,
     ):
