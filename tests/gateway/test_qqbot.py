@@ -99,6 +99,18 @@ class TestVoiceAttachmentSSRFProtection:
         return QQAdapter(_make_config(**extra))
 
 
+    @pytest.mark.parametrize(("url", "authenticated"), [
+        ("https://multimedia.nt.qq.com.cn/download", True),
+        ("https://cdn.qq.com/media", True),
+        ("https://files.example.org/media", False),
+        ("http://cdn.qq.com/media", False),
+        ("https://cdn.qq.com:8443/media", False),
+    ])
+    def test_media_credentials_are_origin_scoped(self, url, authenticated):
+        adapter = self._make_adapter()
+        adapter._access_token = "fixture"
+        assert bool(adapter._qq_media_headers(url)) is authenticated
+
     def test_connect_uses_redirect_guard_hook(self):
         from gateway.platforms.base import ssrf_redirect_guard
         from plugins.platforms.qqbot.adapter import QQAdapter
@@ -127,13 +139,8 @@ class TestVoiceAttachmentTempCleanup:
         return QQAdapter(_make_config(**extra))
 
     def _setup_download_mocks(self, adapter, content=b"RIFFmock-wav-audio-data"):
-        response = mock.Mock()
-        response.content = content
-        response.headers = {"content-type": "audio/wav"}
-        response.raise_for_status = mock.Mock()
-
         adapter._http_client = mock.AsyncMock()
-        adapter._http_client.get = mock.AsyncMock(return_value=response)
+        adapter._download_media_bytes = mock.AsyncMock(return_value=content)
 
     def test_temp_wav_cleaned_up_on_stt_failure(self):
         adapter = self._make_adapter(app_id="a", client_secret="b")

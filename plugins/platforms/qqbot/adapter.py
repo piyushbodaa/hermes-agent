@@ -41,7 +41,7 @@ except ImportError:
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     gateway_trust_env, BasePlatformAdapter, ExecApprovalPrompt, SendResult,
-    cache_document_from_bytes_async, cache_image_from_bytes_async,
+    cache_document_from_bytes_async, cache_image_from_bytes_async, _read_httpx_body_with_limit,
 )
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.platforms.helpers import strip_markdown
@@ -978,9 +978,7 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         if not self._http_client:
             return None
         try:
-            resp = await self._http_client.get(url, timeout=30.0, headers=self._qq_media_headers())
-            resp.raise_for_status()
-            data = resp.content
+            data = await self._download_media_bytes(url)
         except Exception as exc:
             logger.debug("[%s] Download failed for %s: %s", self._log_tag, url[:80], exc)
             return None
@@ -1005,9 +1003,18 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             return False
         return filename.strip().lower().endswith(_VOICE_EXTENSIONS)
 
-    def _qq_media_headers(self) -> dict[str, str]:
-        """Authorization header for QQ multimedia CDN downloads (required, else non-200)."""
-        return {"Authorization": f"QQBot {self._access_token}"} if self._access_token else {}
+    def _qq_media_headers(self, url: str) -> dict[str, str]:
+        """Only designated QQ HTTPS media origins may receive the bot credential."""
+        parsed = httpx.URL(url)
+        if (self._access_token and parsed.scheme == "https" and parsed.port in (None, 443)
+                and not parsed.userinfo and parsed.host in {"multimedia.nt.qq.com.cn", "cdn.qq.com"}):
+            return {"Authorization": f"QQBot {self._access_token}"}
+        return {}
+
+    async def _download_media_bytes(self, url: str) -> bytes:
+        async with self._http_client.stream("GET", url, headers=self._qq_media_headers(url), timeout=30.0) as response:
+            response.raise_for_status()
+            return await _read_httpx_body_with_limit(response, media_type="QQ attachment")
 
     async def _stt_voice_attachment(
         self, url: str, content_type: str, filename: str, *, asr_refer_text: Optional[str] = None,
@@ -1034,17 +1041,7 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             if not self._http_client:
                 logger.warning("[%s] STT: no HTTP client", self._log_tag)
                 return None
-            download_headers = self._qq_media_headers()  # QQ CDN requires Authorization
-            logger.debug(
-                "[%s] STT: downloading voice from %s (pre_wav=%s, headers=%s)",
-                self._log_tag, download_url[:80], is_pre_wav, bool(download_headers))
-            resp = await self._http_client.get(
-                download_url, timeout=30.0, headers=download_headers, follow_redirects=True)
-            resp.raise_for_status()
-            audio_data = resp.content
-            logger.debug(
-                "[%s] STT: downloaded %d bytes, content_type=%s",
-                self._log_tag, len(audio_data), resp.headers.get("content-type", "unknown"))
+            audio_data = await self._download_media_bytes(download_url)
             if len(audio_data) < 10:
                 logger.warning("[%s] STT: downloaded data too small (%d bytes), skipping", self._log_tag, len(audio_data))
                 return None
@@ -1069,7 +1066,7 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             else:
                 logger.warning("[%s] STT: ASR returned empty transcript", self._log_tag)
             return transcript
-        except (OSError, httpx.HTTPStatusError, httpx.TransportError) as exc:
+        except (OSError, ValueError, httpx.HTTPStatusError, httpx.TransportError) as exc:
             logger.warning("[%s] STT failed for voice attachment: %s: %s", self._log_tag, type(exc).__name__, exc)
             return None
 
