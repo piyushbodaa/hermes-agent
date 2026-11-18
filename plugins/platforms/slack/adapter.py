@@ -50,7 +50,7 @@ from gateway.platforms.base import (
     gateway_trust_env, BasePlatformAdapter, ExecApprovalPrompt,
     SendResult, SUPPORTED_DOCUMENT_TYPES, SUPPORTED_VIDEO_TYPES, _TEXT_INJECT_EXTENSIONS,
     is_host_excluded_by_no_proxy, resolve_proxy_url, ssrf_redirect_guard,
-    cache_document_from_bytes_async, cache_video_from_bytes_async,
+    cache_document_from_bytes_async, cache_video_from_bytes_async, _read_httpx_body_with_limit,
 )
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 
@@ -6309,13 +6309,17 @@ class SlackAdapter(BasePlatformAdapter):
                     while True:
                         # httpx drops Authorization across origins. Enterprise Grid
                         # needs it on files-origin, but never send it off Slack's CDN.
-                        response = await client.get(
-                            download_url, headers={"Authorization": f"Bearer {bot_token}"})
-                        if response.status_code not in (301, 302, 303, 307, 308):
-                            break
-                        target = redirect_target_from_response(response)
-                        if not target:
-                            break  # raise_for_status reports the malformed redirect.
+                        async with client.stream("GET", download_url, headers={"Authorization": f"Bearer {bot_token}"}) as response:
+                            target = redirect_target_from_response(response) if response.status_code in (301, 302, 303, 307, 308) else None
+                            if not target:
+                                response.raise_for_status()
+                                ct = response.headers.get("content-type", "")
+                                if "text/html" in ct:
+                                    raise ValueError(
+                                        f"Slack returned HTML instead of {html_label} (content-type: {ct}); "
+                                        "check bot token scopes and file permissions, or a cross-origin "
+                                        "redirect dropped the token (Enterprise Grid files-origin)")
+                                return await _read_httpx_body_with_limit(response, media_type="Slack attachment")
                         if not is_safe_url(target):
                             raise ValueError(
                                 "Blocked unsafe Slack file redirect (SSRF protection): "
@@ -6328,14 +6332,6 @@ class SlackAdapter(BasePlatformAdapter):
                             raise ValueError("Too many Slack file redirects (maximum 3)")
                         download_url = target
                         redirect_count += 1
-                    response.raise_for_status()
-                    ct = response.headers.get("content-type", "")
-                    if "text/html" in ct:
-                        raise ValueError(
-                            f"Slack returned HTML instead of {html_label} (content-type: {ct}); "
-                            "check bot token scopes and file permissions, or a cross-origin "
-                            "redirect dropped the token (Enterprise Grid files-origin)")
-                    return response.content
                 except (httpx.TimeoutException, httpx.HTTPStatusError) as exc:
                     if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code < 429:
                         raise

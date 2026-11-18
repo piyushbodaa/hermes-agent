@@ -64,7 +64,7 @@ class _RecordingClient:
     async def __aexit__(self, *exc):
         return False
 
-    async def get(self, *args, **kwargs):
+    def stream(self, *args, **kwargs):
         raise _NetworkTouched("network access attempted")
 
 

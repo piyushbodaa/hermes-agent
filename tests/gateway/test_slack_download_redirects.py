@@ -183,3 +183,15 @@ def test_html_reject_explains_enterprise_grid_redirect(adapter, install_transpor
         200, headers={"content-type": "text/html"}, content=b"sign in"))
     with pytest.raises(ValueError):
         asyncio.run(adapter._download_slack_file_bytes(START))
+
+
+def test_download_honors_body_limit_without_content_length(adapter, install_transport, monkeypatch):
+    monkeypatch.setattr("gateway.platforms.base.get_inbound_media_max_bytes", lambda: 4)
+
+    async def content():
+        yield b"abc"
+        yield b"def"
+
+    install_transport(lambda request: httpx.Response(200, content=content()))
+    with pytest.raises(ValueError, match="size limit|too large|exceeds"):
+        asyncio.run(adapter._download_slack_file_bytes(START))

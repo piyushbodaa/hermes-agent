@@ -346,43 +346,33 @@ class TestSlackDownloadSlackFile:
         monkeypatch.setattr("gateway.platforms.base.IMAGE_CACHE_DIR", tmp_path / "img")
         adapter = _make_slack_adapter()
 
-        fake_response = MagicMock()
-        fake_response.content = b"\x89PNG\r\n\x1a\n fake png"
-        fake_response.raise_for_status = MagicMock()
+        fake_response = _make_stream_response(b"\x89PNG\r\n\x1a\n fake png")
+        fake_response.status_code = 200
         fake_response.headers = {"content-type": "image/png"}
-
-        mock_client = AsyncMock()
-        mock_client.get = AsyncMock(return_value=fake_response)
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client = _make_stream_client(responses=[fake_response])
 
         async def run():
-            with patch("httpx.AsyncClient", return_value=mock_client):
+            with patch("tools.url_safety.create_ssrf_safe_async_client", return_value=mock_client):
                 return await adapter._download_slack_file(
                     "https://files.slack.com/img.jpg", ext=".jpg"
                 )
 
         path = asyncio.run(run())
         assert path.endswith(".jpg")
-        mock_client.get.assert_called_once()
+        mock_client.stream.assert_called_once()
 
     def test_rejects_html_response(self, tmp_path, monkeypatch):
         """An HTML sign-in page from Slack is rejected, not cached as image."""
         monkeypatch.setattr("gateway.platforms.base.IMAGE_CACHE_DIR", tmp_path / "img")
         adapter = _make_slack_adapter()
 
-        fake_response = MagicMock()
-        fake_response.content = b"<!DOCTYPE html><html><title>Slack</title></html>"
-        fake_response.raise_for_status = MagicMock()
+        fake_response = _make_stream_response(b"<!DOCTYPE html><html><title>Slack</title></html>")
+        fake_response.status_code = 200
         fake_response.headers = {"content-type": "text/html; charset=utf-8"}
-
-        mock_client = AsyncMock()
-        mock_client.get = AsyncMock(return_value=fake_response)
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client = _make_stream_client(responses=[fake_response])
 
         async def run():
-            with patch("httpx.AsyncClient", return_value=mock_client):
+            with patch("tools.url_safety.create_ssrf_safe_async_client", return_value=mock_client):
                 await adapter._download_slack_file(
                     "https://files.slack.com/img.jpg", ext=".jpg"
                 )
@@ -407,18 +397,13 @@ class TestSlackDownloadSlackFileBytes:
         """Successful download returns raw bytes."""
         adapter = _make_slack_adapter()
 
-        fake_response = MagicMock()
-        fake_response.content = b"raw bytes here"
-        fake_response.raise_for_status = MagicMock()
+        fake_response = _make_stream_response(b"raw bytes here")
+        fake_response.status_code = 200
         fake_response.headers = {"content-type": "application/pdf"}
-
-        mock_client = AsyncMock()
-        mock_client.get = AsyncMock(return_value=fake_response)
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client = _make_stream_client(responses=[fake_response])
 
         async def run():
-            with patch("httpx.AsyncClient", return_value=mock_client):
+            with patch("tools.url_safety.create_ssrf_safe_async_client", return_value=mock_client):
                 return await adapter._download_slack_file_bytes(
                     "https://files.slack.com/file.bin"
                 )
